@@ -1,0 +1,47 @@
+{
+  "rich_widgets": [
+    {
+      "kind": "roller",
+      "id": "roller_mode",
+      "options": [
+        "Auto",
+        "Manual",
+        "Service",
+        "Bootstrap"
+      ]
+    },
+    {
+      "kind": "chart",
+      "id": "chart_bus",
+      "chart_kind": "line",
+      "min": 0,
+      "max": 400,
+      "points": 120,
+      "series": [
+        {
+          "name": "Ibus",
+          "color": "#5EE6C4",
+          "width": 2
+        },
+        {
+          "name": "Limit",
+          "color": "#F2B84B",
+          "width": 1
+        }
+      ]
+    },
+    {
+      "kind": "table",
+      "id": "table_events",
+      "cols": 3,
+      "rows": 5,
+      "header": [
+        "Time",
+        "Code",
+        "Message"
+      ]
+    }
+  ],
+  "default_font": "demo_16",
+  "project_name": "richdata-demo"
+}
