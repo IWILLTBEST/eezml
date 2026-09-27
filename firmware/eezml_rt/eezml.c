@@ -942,7 +942,11 @@ void eezml_unload(void)
     memset(s_ids, 0, sizeof(s_ids));
     s_id_cnt = 0;
     memset(s_evts, 0, sizeof(s_evts));
-    for (int i = 0; i < s_var_cnt; i++) lv_subject_delete(&s_vars[i].subject);
+    /* do NOT lv_subject_delete() here: object deletion above has already
+     * unbound and freed every obj-attached observer node, so the subject
+     * chains are stale — touching them is a double free. The subjects
+     * themselves live in the static s_vars array; just wipe it. */
+    memset(s_vars, 0, sizeof(s_vars));
     s_var_cnt = 0;
     memset(s_actions, 0, sizeof(s_actions));
     s_action_cnt = 0;
