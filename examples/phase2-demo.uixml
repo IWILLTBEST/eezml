@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui xmlns:lv="urn:eez:lv">
+  <project width="1024" height="600" />
+  <var name="count" type="integer" default="0" />
+  <var name="label_text" type="string" default="eezml phase-2 live" />
+  <screen name="main">
+    <panel id="panel1" x="120" y="140" w="420" h="300" bg="#1B2436" radius="16" lv:shadow-width="26" lv:shadow-spread="3" lv:shadow-color="#000000" lv:shadow-opa="130">
+      <label id="lbl_title" x="24" y="20" w="300" h="30" text="eezml phase 2" color="#5EE6C4" />
+      <label id="lbl_sub" x="24" y="52" w="360" h="24" bind="label_text" color="#8FA0BC" />
+      <label id="lbl_count" x="24" y="96" w="200" h="56" bind="count" color="#FFFFFF" />
+      <button id="btn" x="24" y="200" w="180" h="70" text="Click +1" radius="12" bg="#0F6B4F" color="#FFFFFF" on-clicked="on_btn" />
+    </panel>
+  </screen>
+  <action name="on_btn">
+    <anim prop="y" target="btn" from="200" to="188" time="90" />
+    <call native="inc_count" />
+    <anim prop="y" target="btn" from="188" to="200" time="140" delay="120" />
+  </action>
+</ui>
