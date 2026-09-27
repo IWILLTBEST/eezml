@@ -23,6 +23,7 @@
 #define EEZML_MAX_BITMAPS 32
 #define EEZML_MAX_FONTS   32
 #define EEZML_MAX_IDS     64
+#define EEZML_NAME_LEN    32   /* defined early: used by registries + behavior */
 
 typedef struct {
     const char * name;
@@ -288,7 +289,6 @@ static const style_prop_t * lookup_style_prop(const char * name)
 #define EEZML_MAX_ACTIONS  16
 #define EEZML_MAX_STEPS    24
 #define EEZML_MAX_NATIVES  16
-#define EEZML_NAME_LEN     32
 
 typedef struct {
     char name[EEZML_NAME_LEN];
@@ -327,6 +327,17 @@ static eezml_native_t  s_natives[EEZML_MAX_NATIVES];
 static int             s_native_cnt;
 static eezml_change_screen_fn s_change_screen_fn;
 static void *          s_change_screen_user;
+
+/* ---- variable snapshot (hot reload state carry-over) ------------ */
+#define EEZML_MAX_SNAP 16
+typedef struct {
+    char name[EEZML_NAME_LEN];
+    uint8_t is_string;
+    int32_t i;
+    char s[64];
+} eezml_snap_t;
+static eezml_snap_t s_snap[EEZML_MAX_SNAP];
+static int s_snap_cnt;
 
 /* ---- variables & subjects --------------------------------------- */
 
@@ -899,20 +910,11 @@ static void XMLCALL on_end(void * userData, const XML_Char * name)
 /* ---- hot reload support ------------------------------------------ */
 
 #define EEZML_MAX_TOPLEVEL 16
-#define EEZML_MAX_SNAP     EEZML_MAX_VARS
 
 static lv_obj_t * s_top_objs[EEZML_MAX_TOPLEVEL];   /* objects we created */
 static int        s_top_cnt;
 static lv_obj_t * s_last_parent;                    /* reload target */
 
-typedef struct {
-    char name[EEZML_NAME_LEN];
-    uint8_t is_string;
-    int32_t i;
-    char s[64];
-} eezml_snap_t;
-static eezml_snap_t s_snap[EEZML_MAX_SNAP];
-static int s_snap_cnt;
 
 static void snapshot_vars(void)
 {
@@ -947,9 +949,22 @@ void eezml_unload(void)
     /* s_natives survives: C-side assets outlive documents */
 }
 
+/* syntax-only dry parse: reports whether the document is well-formed XML
+ * without touching any state (handlers NULL) */
+static int xml_is_wellformed(const char * xml)
+{
+    XML_Parser p = XML_ParserCreate(NULL);
+    if (!p) return 0;
+    int ok = XML_Parse(p, xml, (int)strlen(xml), 1) == XML_STATUS_OK;
+    XML_ParserFree(p);
+    return ok;
+}
+
 lv_obj_t * eezml_reload(const char * xml)
 {
-    if (!s_last_parent) return NULL;
+    if (!s_last_parent || !xml) return NULL;
+    /* keep the old UI alive unless the new document parses cleanly */
+    if (!xml_is_wellformed(xml)) return NULL;
     eezml_unload();
     return eezml_create(s_last_parent, xml);
 }
