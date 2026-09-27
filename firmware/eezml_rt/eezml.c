@@ -35,7 +35,7 @@ typedef struct {
 } eezml_font_entry_t;
 
 typedef struct {
-    const char * id;
+    char id[EEZML_NAME_LEN];
     lv_obj_t * obj;
 } eezml_id_entry_t;
 
@@ -360,6 +360,24 @@ void eezml_set_var_string(const char * name, const char * value)
 static void var_declare(const char * name, const char * type, const char * dflt)
 {
     if (!name || s_var_cnt >= EEZML_MAX_VARS) return;
+    /* hot reload: restore the pre-unload value for a same-named variable */
+    for (int si = 0; si < s_snap_cnt; si++) {
+        if (strcmp(s_snap[si].name, name) == 0) {
+            type = s_snap[si].is_string ? "string" : "integer";
+            dflt = s_snap[si].is_string ? s_snap[si].s : NULL;
+            if (!s_snap[si].is_string) {
+                /* declare with default 0, then apply the snapshot value */
+                eezml_var_t * v = &s_vars[s_var_cnt];
+                memset(v, 0, sizeof(*v));
+                strncpy(v->name, name, EEZML_NAME_LEN - 1);
+                lv_subject_init_int(&v->subject, 0);
+                lv_subject_set_int(&v->subject, s_snap[si].i);
+                s_var_cnt++;
+                return;
+            }
+            break;
+        }
+    }
     eezml_var_t * v = &s_vars[s_var_cnt];
     memset(v, 0, sizeof(*v));
     strncpy(v->name, name, EEZML_NAME_LEN - 1);
@@ -553,7 +571,9 @@ void eezml_set_change_screen_handler(eezml_change_screen_fn fn, void * user_data
 
 /* ---- event bridge ------------------------------------------------ */
 
-typedef struct { char action[EEZML_NAME_LEN]; } eezml_evt_t;
+#define EEZML_MAX_EVTS 64
+typedef struct { char action[EEZML_NAME_LEN]; uint8_t used; } eezml_evt_t;
+static eezml_evt_t s_evts[EEZML_MAX_EVTS];
 
 static void event_cb(lv_event_t * e)
 {
@@ -798,12 +818,9 @@ static void XMLCALL on_start(void * userData, const XML_Char * name,
             apply_lv_attr(obj, an + 3, av);
         } else if (strcmp(an, "id") == 0) {
             if (s_id_cnt < EEZML_MAX_IDS) {
-                s_ids[s_id_cnt].id = lv_malloc(strlen(av) + 1);
-                if (s_ids[s_id_cnt].id) {
-                    strcpy((char *)s_ids[s_id_cnt].id, av);
-                    s_ids[s_id_cnt].obj = obj;
-                    s_id_cnt++;
-                }
+                strncpy(s_ids[s_id_cnt].id, av, EEZML_NAME_LEN - 1);
+                s_ids[s_id_cnt].obj = obj;
+                s_id_cnt++;
             }
         } else if (strcmp(an, "x") == 0) {
             lv_obj_set_x(obj, (int32_t)strtol(av, NULL, 10));
@@ -839,9 +856,12 @@ static void XMLCALL on_start(void * userData, const XML_Char * name,
         } else if (strncmp(an, "on-", 3) == 0) {
             for (size_t ei = 0; ei < sizeof(k_events) / sizeof(k_events[0]); ei++) {
                 if (strcmp(an + 3, k_events[ei].attr) == 0) {
-                    eezml_evt_t * ev = (eezml_evt_t *)lv_malloc(sizeof(eezml_evt_t));
+                    eezml_evt_t * ev = NULL;
+                    for (int si = 0; si < EEZML_MAX_EVTS; si++) {
+                        if (!s_evts[si].used) { ev = &s_evts[si]; break; }
+                    }
                     if (ev) {
-                        memset(ev, 0, sizeof(*ev));
+                        ev->used = 1;
                         strncpy(ev->action, av, EEZML_NAME_LEN - 1);
                         lv_obj_add_event_cb(obj, event_cb, k_events[ei].code, ev);
                     }
@@ -876,6 +896,64 @@ static void XMLCALL on_end(void * userData, const XML_Char * name)
     }
 }
 
+/* ---- hot reload support ------------------------------------------ */
+
+#define EEZML_MAX_TOPLEVEL 16
+#define EEZML_MAX_SNAP     EEZML_MAX_VARS
+
+static lv_obj_t * s_top_objs[EEZML_MAX_TOPLEVEL];   /* objects we created */
+static int        s_top_cnt;
+static lv_obj_t * s_last_parent;                    /* reload target */
+
+typedef struct {
+    char name[EEZML_NAME_LEN];
+    uint8_t is_string;
+    int32_t i;
+    char s[64];
+} eezml_snap_t;
+static eezml_snap_t s_snap[EEZML_MAX_SNAP];
+static int s_snap_cnt;
+
+static void snapshot_vars(void)
+{
+    s_snap_cnt = 0;
+    for (int i = 0; i < s_var_cnt && s_snap_cnt < EEZML_MAX_SNAP; i++) {
+        eezml_snap_t * sn = &s_snap[s_snap_cnt++];
+        strncpy(sn->name, s_vars[i].name, EEZML_NAME_LEN - 1);
+        sn->is_string = s_vars[i].is_string;
+        if (s_vars[i].is_string) {
+            strncpy(sn->s, (const char *)s_vars[i].subject.value.pointer, sizeof(sn->s) - 1);
+        } else {
+            sn->i = s_vars[i].subject.value.num;
+        }
+    }
+}
+
+void eezml_unload(void)
+{
+    snapshot_vars();
+    /* deleting the objects also unbinds their observers */
+    for (int i = 0; i < s_top_cnt; i++) {
+        if (s_top_objs[i]) lv_obj_delete(s_top_objs[i]);
+    }
+    s_top_cnt = 0;
+    memset(s_ids, 0, sizeof(s_ids));
+    s_id_cnt = 0;
+    memset(s_evts, 0, sizeof(s_evts));
+    for (int i = 0; i < s_var_cnt; i++) lv_subject_delete(&s_vars[i].subject);
+    s_var_cnt = 0;
+    memset(s_actions, 0, sizeof(s_actions));
+    s_action_cnt = 0;
+    /* s_natives survives: C-side assets outlive documents */
+}
+
+lv_obj_t * eezml_reload(const char * xml)
+{
+    if (!s_last_parent) return NULL;
+    eezml_unload();
+    return eezml_create(s_last_parent, xml);
+}
+
 /* ------------------------------------------------------------------ */
 /* public entry                                                        */
 /* ------------------------------------------------------------------ */
@@ -887,11 +965,13 @@ lv_obj_t * eezml_create(lv_obj_t * parent, const char * xml)
     eezml_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    /* reset id table per document (names are document-scoped in phase 1) */
-    for (int i = 0; i < s_id_cnt; i++) {
-        lv_free((void *)s_ids[i].id);
-    }
+    /* reset id table per document (names are document-scoped) */
+    memset(s_ids, 0, sizeof(s_ids));
     s_id_cnt = 0;
+
+    /* hot reload bookkeeping */
+    s_last_parent = parent;
+    int base_child_cnt = lv_obj_get_child_count(parent);
 
     XML_Parser p = XML_ParserCreate(NULL);
     if (!p) return NULL;
@@ -906,7 +986,14 @@ lv_obj_t * eezml_create(lv_obj_t * parent, const char * xml)
     lv_obj_t * result = NULL;
     if (XML_Parse(p, xml, (int)strlen(xml), 1) == XML_STATUS_OK) {
         result = ctx.root ? ctx.root : parent;
+        /* register every toplevel object we created under parent */
+        int now = lv_obj_get_child_count(parent);
+        for (int i = base_child_cnt; i < now && s_top_cnt < EEZML_MAX_TOPLEVEL; i++) {
+            s_top_objs[s_top_cnt++] = lv_obj_get_child(parent, i);
+        }
     }
     XML_ParserFree(p);
+    /* snapshot consumed */
+    s_snap_cnt = 0;
     return result;
 }

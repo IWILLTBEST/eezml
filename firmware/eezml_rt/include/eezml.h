@@ -57,6 +57,19 @@ typedef void (* eezml_change_screen_fn)(const char * target, void * user_data);
 void        eezml_set_change_screen_handler(eezml_change_screen_fn fn,
                                             void * user_data);
 
+/* ------------------------------------------------------------------ */
+/* Phase 3: hot reload                                                 */
+/* ------------------------------------------------------------------ */
+
+/** Tear down the current document: delete its objects (which also unbinds
+ *  observers), clear ids/events/actions/variables. Native action registry
+ *  survives. Same-named variables are restored from a pre-unload snapshot
+ *  on the next eezml_create(). */
+void        eezml_unload(void);
+
+/** unload + create from the last parent, atomically. Returns the new root. */
+lv_obj_t *  eezml_reload(const char * xml);
+
 #ifdef __cplusplus
 }
 #endif
