@@ -33,6 +33,30 @@ void eezml_register_font(const char * name, const lv_font_t * font);
 /** Look up a created object by its XML id attribute (per-document scope). */
 lv_obj_t * eezml_get_object(const char * id);
 
+/* ------------------------------------------------------------------ */
+/* Phase 2: variables, actions, bindings, native actions               */
+/* ------------------------------------------------------------------ */
+
+/** Variable access from C business code (drives `bind="..."` UI updates).
+ *  String variables are copied into the internal buffer. */
+int32_t     eezml_get_var_int(const char * name);
+void        eezml_set_var_int(const char * name, int32_t value);
+void        eezml_set_var_string(const char * name, const char * value);
+
+/** Trigger a declarative <action name="..."> from C. */
+void        eezml_run_action(const char * name);
+
+/** Native (C) action registry: XML <call native="name"/> lands here. */
+typedef void (* eezml_native_fn)(void * user_data);
+void        eezml_register_native(const char * name, eezml_native_fn fn,
+                                  void * user_data);
+
+/** Screen-change hook: <change-screen target="..."/> calls this handler.
+ *  The platform decides how screens are organized and switched. */
+typedef void (* eezml_change_screen_fn)(const char * target, void * user_data);
+void        eezml_set_change_screen_handler(eezml_change_screen_fn fn,
+                                            void * user_data);
+
 #ifdef __cplusplus
 }
 #endif
