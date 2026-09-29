@@ -47,10 +47,11 @@ All screens below were generated from the toolchain and captured through the
 | `ir2eez.py` / `eez2ir.py` | IR ↔ EEZ 工程转换（Import 回流 / 工程解析） |
 | `generator.py` | html2eez（HTML → EEZ 工程） |
 | `migrate_uixml.py` | JSON IR → uixml 迁移工具 |
+| `SKILL.md` / `SKILL.zh-CN.md` | AI 手册：照分步工作流生成 EEZ 工程（英 / 中，内容等价） |
 | `firmware/eezml_rt/` | **可移植运行时内核**（纯 C + lvgl + bundled expat，零平台依赖；ESP-IDF 之外的平台直接把源文件加入构建） |
 | `vscode/` | VS Code 扩展（双模式预览 / Import / Run） |
 | `tools/` | A-WASM 模拟器构建、金标准 CI、视觉回归 |
-| `examples/` | glass / i18n / motor / richdata 示例 |
+| `examples/` | glass / i18n / motor / richdata / phase2-demo 示例 |
 | `golden/` | 金标准回归数据 |
 
 ## 快速上手

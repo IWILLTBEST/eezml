@@ -46,7 +46,7 @@ EEZ Studio 工程 ──eezml_export.py──> eezml (uixml XML)
 | `ir2eez.py` / `eez2ir.py` | IR ↔ EEZ 工程转换（Import 回流 / 工程解析） |
 | `generator.py` | html2eez（HTML → EEZ 工程） |
 | `migrate_uixml.py` | JSON IR → uixml 迁移工具 |
-| `SKILL.md` | ir2eez 的 AI 技能文档 |
+| `SKILL.md` / `SKILL.zh-CN.md` | AI 手册：照分步工作流生成 EEZ 工程（英 / 中，内容等价） |
 | `firmware/eezml_rt/` | **可移植运行时内核**（纯 C + lvgl + bundled expat，零平台依赖；ESP-IDF 之外的平台直接把源文件加入构建） |
 | `vscode/` | VS Code 扩展（双模式预览 / Import / Run） |
 | `tools/` | A-WASM 模拟器构建、金标准 CI、视觉回归 |
