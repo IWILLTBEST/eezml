@@ -11,12 +11,12 @@ description: Generate EEZ Studio LVGL .eez-project files from a declarative IR J
 
 | 方式 | 适用 | 说明 |
 |------|------|------|
-| **MCP Server**（主路线） | Claude Desktop / Cursor / ZCode 等任何 MCP 客户端 | `eez_mcp_server.py`，45 工具 + 6 资源（3 活资源可订阅）+ 进度通知 |
+| **MCP Server**（主路线） | Claude Desktop / Cursor / ZCode 等任何 MCP 客户端 | [eez-studio-mcp 仓](https://github.com/IWILLTBEST/eez-studio-mcp)：47 工具 + 资源订阅 + 进度通知，安装与配置见其 README |
 | **DeepSeek Harness** | dsh Web UI / Studio Toolbar AI 按钮 | 经同一 MCP/HTTP 桥 |
 
 内置 LLM agent 面板已移除（双轨维护成本高，Studio 只提供桥）。
 
-三种方式共用同一个 HTTP 桥（`127.0.0.1:17620`），工具实现在 `packages/ai-agent/tools.ts`。
+两种方式共用同一个 HTTP 桥（`127.0.0.1:17620`，由 eez-studio-mcp 仓的扩展或 [IWILLTBEST/studio](https://github.com/IWILLTBEST/studio) fork 内置提供）。
 
 ## 工具链
 
@@ -24,10 +24,10 @@ description: Generate EEZ Studio LVGL .eez-project files from a declarative IR J
 - 编译器：`ir2eez.py`（内置 IR 校验 + 产物自检 + 字形覆盖校验，**退出码非 0 = 失败，文件未写盘**）
 - 预览：`ir_preview.py`（编译产物坐标 → SVG）
 - 格式文档：`IR_SCHEMA.md`（**写 IR 前必读**）
-- MCP Server：`eez_mcp_server.py`（`pip install mcp httpx`）
+- MCP Server：在 [eez-studio-mcp 仓](https://github.com/IWILLTBEST/eez-studio-mcp)（`eez_mcp_server.py` / `mcp-server.mjs`，安装见其 README）
 - 字体工具：`font_tool.py`（compile/scan-html/list/show）
 - Python：`python`
-- EEZ Studio 源码：https://github.com/IWILLTBEST/studio （EEZ Studio v0.30.0 fork + ai-agent 桥，GPL-3.0）
+- EEZ Studio 源码：https://github.com/IWILLTBEST/studio （fork + 内置 ai-agent 桥，GPL-3.0；扩展 API 在上游 master，官方 release 尚未包含）
 - 例子：`motor.uixml`（电机控制器 3 屏，含每屏独立导航）/ `richdata.uixml` + `make_richdata.py`
 
 ## 工作流程
@@ -73,6 +73,7 @@ D:/.../python.exe ir2eez.py <输入.uixml> -o <输出.eez-project>; echo exit=$?
 4. **等宽数值盒：ceil 宽度 + longMode CLIP**（Trap 20）：adv_w/16 有亚像素（如 10.8125px/字），盒宽差 0.25px 就会 WRAP 到第二行被裁（显示 "13." 丢 "4"，长得像字体 bug）。规则：`width = ceil(len × 每字宽) + 1`，数值 label 用 `longMode: "CLIP"`。ir2eez 宽度兜底已含 +16 padding，多数场景已防住；固定宽数值盒可再显式 CLIP 双保险。
 5. **颜色集中定义，禁散落裸 hex**（其"non-negotiable rule"）：换肤/改主题时散落的 hex 全是穿帮点。其纪律：新色必须先提案命名 token（含亮/暗主题各自色值 + 是否 theme-invariant）再引用。IR 等价物：颜色集中在 themes 段，MCP `set_theme_color` 一处改全局生效；手改 JSON 时同样别在 localStyles 里新增裸 hex。
 6. **canvas 必须诚实代表设备**（Trap 14）：运行时由固件填充内容的 label，IR 里 text 留空或 "-"，别写 "Network 1..8" 假占位——用户在 canvas 看到的应与设备未填充时一致，canvas 就是设备预览。
+7. **注入的 widget JSON 必须显式带全默认字段（label 的 longMode 是实锤案例）**：手写/AI 生成器注入的 widget 不走 classInfo defaults——palette 创建的 label 默认带 `longMode: "WRAP"`，注入的没有 → codegen 输出 `lv_label_set_long_mode(obj, LV_LABEL_LONG_undefined)` **编译失败**（canvas/check 都不报，只有真编译暴露；2026-09-09 Denis 在 examples #5 实锤，Chart/Table/List/Menu/TileView 五示例全中）。规则：任何注入的 label 必须显式 `longMode`（WRAP/CLIP/DOTS/SCROLL/SCROLL_CIRCULAR 按需）；同理 widgetFlags、tile 的 `direction`（位掩码语义，网格自由导航用 "ALL"，单值 RIGHT 会锁死滑动）、msgbox 按钮的 closeButton 等默认字段都要显式写全。**check 0/0 ≠ 可编译：C 产物必须真验证（build 落盘后 grep undefined/读 screens.c）。**
 
 ## 交互效果模式
 
@@ -88,19 +89,19 @@ D:/.../python.exe ir2eez.py <输入.uixml> -o <输出.eez-project>; echo exit=$?
 
 ## MCP Server 接入
 
+Server、桥扩展的安装步骤、配置样例和 47 个工具的完整能力域清单，见 **[eez-studio-mcp](https://github.com/IWILLTBEST/eez-studio-mcp)** 仓 README（该仓是 MCP 线的唯一主页）。快速接入（Claude Desktop）：
+
 ```json
-// Claude Desktop → %APPDATA%/Claude/claude_desktop_config.json
+// %APPDATA%/Claude/claude_desktop_config.json
 {
   "mcpServers": {
     "eez-studio": {
       "command": "python",
-      "args": ["<repo>/eez_mcp_server.py"]
+      "args": ["<eez-studio-mcp 仓路径>/eez_mcp_server.py"]
     }
   }
 }
 ```
-
-47 个工具，能力域：IR 流水线（read/write_ir、compile、reload、navigate、screenshot）/ 部件级编辑（list/get/update/delete_object、create_widget/screen、undo/redo、goto_object、get_selection，路径或 objID 寻址）/ 样式主题（update_style、set_theme_color、set_preview_theme…）/ 工程文件（read/write/patch_project_json）/ 多工程（list/select/open_project）/ 诊断（read_output、check、build_project）/ 调试（debug_start/stop/control/status、read/write_variable、send_input 点击滑动注入）/ 资产（add_font、add_image）/ screenshot_object 部件特写 / create_project 新建工程 / **视觉回归（visual_baseline、visual_check）**。资源：IR/规范/技能文档 + 活资源 eez://checks、eez://debug、eez://state（可订阅，变化即推送）。长操作（check/build/debug_start/add_font…）支持进度通知。
 
 ## 字体流水线
 
@@ -117,7 +118,7 @@ font_tool.py compile --src fonts/msyh.ttf --name <名>_<字号> --size <字号> 
 
 - EEZ Studio 里开着项目时**不要重新编译**（EEZ 缓存旧版，一保存就覆盖）
 - 手工改动想保留 → 描述改动 → 同步进 IR → 再编译（IR 是唯一源头）
-- IR 修改策略：小改动用内置 edit（手术式），大改动用 eez_write_ir（全量重写）
+- IR 修改策略：小改动用内置 edit（手术式），大改动用 `write_ir`（全量重写）
 - 交付后说明验证点（哪些效果要上设备看）
 
 ## 截图比对前必查：变量 default
