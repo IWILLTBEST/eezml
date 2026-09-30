@@ -1,14 +1,22 @@
 # eezml
 
-EEZ Studio → XML → 固件运行时构建 UI 的完整工具链（自有格式，对标 LVGL Pro 的 XML 动态加载能力）。
+[中文版](README.zh-CN.md)
+
+A complete toolchain for **EEZ Studio → XML → runtime-built UI on firmware** (own format, benchmarked against LVGL Pro's XML dynamic loading).
 
 ```
-EEZ Studio 工程 ──eezml_export.py──> eezml (uixml XML)
-                                          │
-                                    EMBED / 文件系统
-                                          ▼
-                              firmware/eezml_rt 运行时内核
-                              （expat SAX + 对象树构建，纯 C 可移植）
+EEZ Studio project ──eezml_export.py──> eezml (uixml XML)
+                                               │
+                                         EMBED / file system
+                                               ▼
+                                 firmware/eezml_rt runtime kernel
+                                 (expat SAX + object-tree build, portable C)
+                                               │
+                            ┌──────────────────┴──────────────────┐
+                            ▼                                     ▼
+                     boot: eezml_create()              hot reload: push XML over
+                                                              UART/USB, rebuild
+                                                              the live object tree
 ```
 
 ## Screenshots
@@ -38,41 +46,75 @@ All screens below were generated from the toolchain and captured through the
 |---|---|---|
 | ![main](docs/img/richdata.png) | ![controls](docs/img/richdata-controls.png) | ![settings](docs/img/richdata-settings.png) |
 
-## 组成
+## What's inside
 
-| 目录/文件 | 说明 |
+| Path | Description |
 |---|---|
-| `eezml_export.py` | .eez-project → uixml XML + assets 清单导出器 |
-| `uixml.py` | uixml 格式核心（XML↔IR 双向无损） |
-| `ir2eez.py` / `eez2ir.py` | IR ↔ EEZ 工程转换（Import 回流 / 工程解析） |
-| `generator.py` | html2eez（HTML → EEZ 工程） |
-| `migrate_uixml.py` | JSON IR → uixml 迁移工具 |
-| `SKILL.md` / `SKILL.zh-CN.md` | AI 手册：照分步工作流生成 EEZ 工程（英 / 中，内容等价） |
-| `firmware/eezml_rt/` | **可移植运行时内核**（纯 C + lvgl + bundled expat，零平台依赖；ESP-IDF 之外的平台直接把源文件加入构建） |
-| `vscode/` | VS Code 扩展（双模式预览 / Import / Run） |
-| `tools/` | A-WASM 模拟器构建、金标准 CI、视觉回归 |
-| `examples/` | glass / i18n / motor / richdata / phase2-demo 示例 |
-| `golden/` | 金标准回归数据 |
+| `eezml_export.py` | .eez-project → uixml XML + assets manifest exporter |
+| `uixml.py` | uixml format core (lossless XML↔IR round-trip) |
+| `ir2eez.py` / `eez2ir.py` | IR ↔ EEZ project conversion (Import back / project parsing) |
+| `generator.py` | html2eez (HTML → EEZ project) |
+| `migrate_uixml.py` | JSON IR → uixml migration tool |
+| `SKILL.md` / `SKILL.zh-CN.md` | AI manual: step-by-step workflow to generate EEZ projects (EN / ZH, equivalent) |
+| `firmware/eezml_rt/` | **portable runtime kernel** (pure C + lvgl + bundled expat, zero platform dependencies; non-ESP platforms just add the sources to their build) |
+| `firmware/eezml_uart/` | ESP-IDF port: hot-reload transport (UART / USB-Serial/JTAG) + flash persistence; other platforms reimplement the same small header contract |
+| `tools/` | push tool (below), A-WASM simulator build, golden CI, visual regression |
+| `vscode/` | VS Code extension (dual-mode preview / Import / Run) |
+| `examples/` | glass / i18n / motor / richdata / phase2-demo examples |
+| `golden/` | golden regression data |
 
-## 快速上手
+## Quick start
 
 ```bash
-# 导出 eezml
+# export eezml from an EEZ Studio project
 python eezml_export.py your.eez-project -o out_dir
 
-# 固件侧（ESP-IDF）
-#   components/ 下放 eezml_rt，main 里：
+# firmware side (ESP-IDF):
+#   put eezml_rt + eezml_uart under components/, then in main:
 #   eezml_register_bitmap("bulb", &img_bulb);
-#   eezml_create(lv_screen_active(), xml_text);
+#   eezml_create(lv_screen_active(), xml_text);   // XML from EMBED or persisted
+#   eezml_uart_start();                            // hot-reload transport
 ```
 
-## 路线图
+The phase-2 behavior engine (variables / bindings / actions) is shown in
+`examples/phase2-demo.uixml`: declare `<var>` → `bind="count"` wires an
+lv_observer → `on-clicked` events → declarative `<anim>` / `<call native>`
+steps → the C side drives the UI with `eezml_get/set_var_int`.
 
-- **一期（已完成）**：静态 UI（部件+样式+assets）运行时加载，实机验收=双 GIF 画面与 C 导出等价
-- **二期（进行中）**：声明式 action（anim/set/if/call）+ `bind` 数据绑定（lv_observer）+ 原生 C action 注册表
-- **三期**：热重载（UART/USB 推 XML 秒级重建）、组件层运行时复用（widget-def）、assets 独立生成器
+## Hot reload + persistence
 
-## 许可
+Push a document to a **running** device — no rebuild, no reflash, the live
+object tree is torn down and rebuilt in about a second:
 
-- 本仓工具链代码：随本仓声明
-- `firmware/eezml_rt/expat/`：Expat MIT（原样保留版权头，源自 LVGL 9.4 bundled 副本）
+```bash
+# close idf.py monitor first (the port is exclusive)
+python tools/push.py --port COM5 doc.uixml             # volatile (this session only)
+python tools/push.py --port COM5 doc.uixml --persist   # store in flash, survives reboot
+python tools/push.py --port COM5 --wipe                # forget it, back to the compiled-in UI
+```
+
+- Wire protocol: `EEZML BEGIN <name> <size> [persist]` + raw XML + `EEZML END <crc32>`.
+  Corrupt packets are rejected whole; a syntactically bad document fails a dry
+  run first, so the old UI stays untouched.
+- Variables are snapshotted across a reload — counters and bound state survive.
+- With `--persist` the document is written to the `storage` flash partition
+  (raw `esp_partition` access, no filesystem mounted); on boot the firmware
+  loads the persisted document first and falls back to the compiled-in (EMBED)
+  one. `--wipe` returns to factory.
+- Portability: only `firmware/eezml_uart/` knows about ESP hardware. The
+  kernel (`eezml_rt`), the protocol and the record format are platform-neutral;
+  porting to another MCU means rewriting the small `store/load/wipe` contract
+  against that platform's flash API.
+
+## Roadmap
+
+- **Phase 1 (done)**: static UI (widgets + styles + assets) loaded at runtime; verified on hardware — dual-GIF screen equivalent to the C export
+- **Phase 2 (done)**: declarative actions (12 step verbs) + `bind` data binding (lv_observer) + native C action registry + event bridge; verified on hardware
+- **Phase 3a (done)**: hot reload over UART/USB — push XML to a running device, live rebuild with CRC + dry-run protection
+- **Phase 3b (done)**: persistence — `--persist` survives reboot, EMBED fallback, `--wipe`
+- **Next**: widget-def runtime reuse, standalone assets generator, multi-document slots, "export & push" button in EEZ Studio
+
+## License
+
+- Toolchain code in this repo: as declared in the repo
+- `firmware/eezml_rt/expat/`: Expat MIT (copyright headers kept verbatim, from the LVGL 9.4 bundled copy)
