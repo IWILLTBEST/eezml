@@ -3,9 +3,14 @@
  * @brief ESP-IDF port: hot-reload transport over the console UART.
  *
  * Wire protocol (line-framed):
- *   EEZML BEGIN <name> <size>\n
+ *   EEZML BEGIN <name> <size> [persist]\n
  *   <raw XML bytes x size>
  *   EEZML END <crc32-hex>\n
+ *
+ * The trailing "persist" token makes the document survive a reboot: it is
+ * stored in flash after a successful apply, and the app boots from it
+ * instead of the compiled-in document (see eezml_uart_persist.h).
+ *   EEZML WIPE\n   — forget the persisted document.
  *
  * A complete, CRC-verified packet is applied from an LVGL timer (i.e. on the
  * LVGL task, where it is safe to touch objects) via eezml_reload().
@@ -14,6 +19,7 @@
  */
 
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_err.h"
@@ -22,6 +28,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "eezml.h"
+#include "eezml_uart_persist.h"
 
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include "driver/usb_serial_jtag.h"
@@ -47,6 +54,8 @@ static size_t   s_buf_len;
 static size_t   s_expected;
 static uint32_t s_crc;
 static volatile bool s_pending;          /* packet ready to apply */
+static bool     s_persist;               /* persist after a successful apply */
+static char     s_name[32];              /* document name from BEGIN */
 static char     s_line[96];
 static size_t   s_line_len;
 
@@ -106,15 +115,27 @@ static void apply_timer_cb(lv_timer_t * t)
     s_pending = false;
 
     s_buf[s_buf_len] = '\0';
-    ESP_LOGI(TAG, "applying hot-reload document (%u bytes)", (unsigned)s_buf_len);
+    ESP_LOGI(TAG, "applying hot-reload document (%u bytes%s)",
+             (unsigned)s_buf_len, s_persist ? ", persist" : "");
     lv_obj_t * root = eezml_reload(s_buf);
     if (root) {
+        if (s_persist) {
+            /* flash write from the LVGL task is fine: it blocks for a few
+               ms on a 4..16K erase+write, below any watchdog horizon */
+            if (eezml_uart_persist_store(s_name, s_buf, s_buf_len) == ESP_OK) {
+                transport_write("EEZML OK saved\r\n", 16);
+            } else {
+                transport_write("EEZML ERR save\r\n", 16);
+            }
+        } else {
+            transport_write("EEZML OK\r\n", 10);
+        }
         ESP_LOGI(TAG, "EEZML OK");
-        transport_write("EEZML OK\r\n", 10);
     } else {
         ESP_LOGE(TAG, "EEZML ERR parse");
         transport_write("EEZML ERR parse\r\n", 16);
     }
+    s_persist = false;
     reset_packet();
 }
 
@@ -139,17 +160,27 @@ static void feed_byte(uint8_t b)
         if (s_line_len && s_line[s_line_len - 1] == '\r') s_line[--s_line_len] = '\0';
 
         if (strncmp(s_line, "EEZML BEGIN ", 12) == 0) {
-            /* EEZML BEGIN <name> <size> — name is informational in 3a */
+            /* EEZML BEGIN <name> <size> [persist] */
             char * p = s_line + 12;
-            strtok(p, " ");                 /* skip name */
+            char * nm = strtok(p, " ");
             char * sz = strtok(NULL, " ");
+            char * extra = strtok(NULL, " ");
             size_t n = sz ? (size_t)atol(sz) : 0;
             if (n > 0 && n < EEZML_BUF_MAX) {
                 reset_packet();
                 s_expected = n;
+                s_persist = extra && strcasecmp(extra, "persist") == 0;
+                strncpy(s_name, nm ? nm : "doc", sizeof(s_name) - 1);
+                s_name[sizeof(s_name) - 1] = '\0';
             } else {
                 ESP_LOGE(TAG, "bad BEGIN size");
                 transport_write("EEZML ERR size\r\n", 15);
+            }
+        } else if (strncmp(s_line, "EEZML WIPE", 10) == 0) {
+            if (eezml_uart_persist_wipe() == ESP_OK) {
+                transport_write("EEZML OK wiped\r\n", 16);
+            } else {
+                transport_write("EEZML ERR wipe\r\n", 16);
             }
         } else if (strncmp(s_line, "EEZML END ", 10) == 0) {
             uint32_t want = (uint32_t)strtoul(s_line + 10, NULL, 16);
