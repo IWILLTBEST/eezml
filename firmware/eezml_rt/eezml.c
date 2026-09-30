@@ -679,11 +679,23 @@ static int is_step_verb(const char * tag)
     return 0;
 }
 
-static void set_plain_style(lv_obj_t * obj, const char * name, const char * value)
+static void set_plain_style(lv_obj_t * obj, const eezml_widget_type_t * wt,
+                            const char * name, const char * value)
 {
     lv_color_t c;
     if (strcmp(name, "color") == 0 && parse_color(value, &c)) {
-        lv_obj_set_style_text_color(obj, c, 0);
+        /* the plain "color" attr is the widget's primary color: the arc
+           ring, the bar indicator, the LED tint — text color only for
+           label-ish widgets */
+        if (wt && strcmp(wt->tag, "arc") == 0) {
+            lv_obj_set_style_arc_color(obj, c, 0);
+        } else if (wt && strcmp(wt->tag, "bar") == 0) {
+            lv_obj_set_style_bg_color(obj, c, LV_PART_INDICATOR);
+        } else if (wt && strcmp(wt->tag, "led") == 0) {
+            lv_led_set_color(obj, c);
+        } else {
+            lv_obj_set_style_text_color(obj, c, 0);
+        }
     } else if (strcmp(name, "bg") == 0 && parse_color(value, &c)) {
         lv_obj_set_style_bg_color(obj, c, 0);
     } else if (strcmp(name, "bgOpa") == 0) {
@@ -882,7 +894,7 @@ static void XMLCALL on_start(void * userData, const XML_Char * name,
         } else if (strcmp(an, "bind") == 0) {
             wire_bind(obj, name, av);
         } else {
-            set_plain_style(obj, an, av);
+            set_plain_style(obj, wt, an, av);
         }
     }
 
