@@ -547,7 +547,8 @@ function main() {
                 linkVar[varName] = true;
                 variables.push({ objID: oid(), name: varName, type: "integer", defaultValue: String(xs[0]), persistent: false });
             }
-            const inter = interactions.find(i => i.targetKey && variants.some(vv => vv.key === i.targetKey)) ||
+            const inter = interactions.find(i => i.smart && i.targetKey === v.key) ||
+                interactions.find(i => i.targetKey && variants.some(vv => vv.key === i.targetKey)) ||
                 { duration: 500, k: 170, c: 15, v0: 0 };
             comp.actions.push({
                 objID: oid(), action: "animSpring",
@@ -568,7 +569,8 @@ function main() {
             if (!item || !item.fill) continue;
             const w = matchWidget(v, nm);
             if (!w || w.type !== "LVGLLabelWidget") continue;
-            const inter = interactions.find(i => i.targetKey && variants.some(vv => vv.key === i.targetKey)) ||
+            const inter = interactions.find(i => i.smart && i.targetKey === v.key) ||
+                interactions.find(i => i.targetKey && variants.some(vv => vv.key === i.targetKey)) ||
                 { duration: 500, k: 170, c: 15 };
             // 同组联动的符号图标（Figma 里选中组图标跟文字一起变色）
             const followers = [...iconFollowText.entries()].filter(([, tn]) => tn === nm).map(([wgt]) => wgt);
@@ -588,16 +590,10 @@ function main() {
                 });
             }
         }
-        // 延迟到动画结束再写变量（保护当前位置跟踪）
-        const maxTime = Math.max(500, ...comp.actions.map(a => a.time || 0));
-        const delayComp = {
-            objID: oid(), type: "DelayActionComponent",
-            left: comp.left, top: comp.top + 180, width: 190, height: 54,
-            customInputs: [], customOutputs: [], milliseconds: String(maxTime)
-        };
-        components.push(comp, delayComp, setv);
-        connectionLines.push({ objID: oid(), source: comp.objID, output: "@seqout", target: delayComp.objID, input: "@seqin" });
-        connectionLines.push({ objID: oid(), source: delayComp.objID, output: "@seqout", target: setv.objID, input: "@seqin" });
+        // 直连 SetVariable（对齐手调金标准：动作序列内 spring 先执行并读取变量，
+        // 同 tick 末尾更新变量——快速连点不滞后）
+        components.push(comp, setv);
+        connectionLines.push({ objID: oid(), source: comp.objID, output: "@seqout", target: setv.objID, input: "@seqin" });
         chainByVariant.set(v.key, comp);
         return comp;
     }
