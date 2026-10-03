@@ -302,6 +302,17 @@ function main() {
         defaultVariant = variants.find(v => [...v.content.values()].some(c => interactions.some(i => i.srcKey === c.key))) || variants[0];
     }
 
+    // TEXT 项名 → fill 是否跨变体有差（供图标联动判断）
+    const fillDiffNames = new Set();
+    if (variants.length >= 2) {
+        const names0 = new Set();
+        for (const v of variants) for (const nm of v.content.keys()) names0.add(nm);
+        for (const nm of names0) {
+            const fills = variants.map(v => v.content.get(nm)).filter(Boolean).map(c => c.fill).filter(Boolean);
+            if (new Set(fills).size > 1) fillDiffNames.add(nm);
+        }
+    }
+
     // 6) 静态树生成（从 rootFrame，组件实例位置用默认变体的内容替换）
     const fontUse = new Map(); // "size" -> Set(chars) for CJK
     const widgets = [];
@@ -390,6 +401,8 @@ function main() {
     // rootFrame 静态树；组件集实例（在 rootFrame 里 type INSTANCE/SYMBOL 且指向组件集）→ 用默认变体内容展开
     const hitAreas = [];
     const screenChildren = [];
+    const widgetByItemName = new Map(); // 变体内容名 → 部件（链的目标查找）
+    const iconFollowText = new Map();  // 符号 label 部件 → 跟随的 TEXT 项名
     function emitFrameContent(frameKey, out) {
         for (const c of kids.get(frameKey) || []) {
             const n = nodes.get(c);
@@ -401,8 +414,11 @@ function main() {
                 componentSets.find(s => s.node.name === n.name);
             if (cs && defaultVariant) {
                 // 组件实例 → 默认变体内容（一次性展开）
+                const instFill = solidFill(n);
                 const holder = panelWidget(uniqId("inst"), t.m02 || 0, t.m12 || 0,
-                    (n.size || {}).x || 0, (n.size || {}).y || 0, { bg_opa: 0 });
+                    (n.size || {}).x || 0, (n.size || {}).y || 0,
+                    Object.assign({}, instFill ? { bg_color: instFill } : { bg_opa: 0 },
+                        n.cornerRadius ? { radius: Math.round(n.cornerRadius) } : {}));
                 const vt = nodes.get(defaultVariant.key).transform || {};
                 for (const [name, cc] of defaultVariant.content) {
                     // 变体内容 → 部件（相对实例原点）
@@ -426,6 +442,7 @@ function main() {
                 item.x, item.y, Math.max(item.w, 12), Math.max(item.h, 14), chars,
                 { text_color: fill || "#191919", text_font: font });
             holder.children.push(lbl);
+            if (!widgetByItemName.has(name)) widgetByItemName.set(name, lbl);
             hitCollector.push({ key: item.key, node: item.node, type: "TEXT", widget: lbl, x: item.x, y: item.y, w: item.w, h: item.h });
         } else if (item.type === "VECTOR" || item.type === "INSTANCE") {
             const nm = ((item.node.name || "").split("/").pop() || "").toLowerCase().replace(/\s+/g, "-");
@@ -437,6 +454,12 @@ function main() {
                     Math.max(item.w, 12), Math.max(item.h, 12), String.fromCodePoint(cp),
                     { text_color: "#191919", text_font: font });
                 holder.children.push(lbl);
+                if (!widgetByItemName.has(name)) widgetByItemName.set(name, lbl);
+                // 记录跟随目标：同 x 列（同 tab 组）颜色有差的 TEXT 项
+                const sibText = [...defaultVariant.content.values()]
+                    .filter(c => c.type === "TEXT" && Math.abs(c.x - item.x) < 40 && fillDiffNames.has(c.node.name))
+                    .sort((a, b) => Math.abs(a.x - item.x) - Math.abs(b.x - item.x))[0];
+                if (sibText) iconFollowText.set(lbl, sibText.node.name);
                 hitCollector.push({ key: item.key, node: item.node, type: "VECTOR", widget: lbl, x: item.x, y: item.y, w: item.w, h: item.h });
             }
         } else {
@@ -445,6 +468,7 @@ function main() {
                 Object.assign({}, fill ? { bg_color: fill } : { bg_opa: 0 },
                     item.node.cornerRadius ? { radius: Math.round(item.node.cornerRadius) } : {}));
             holder.children.push(p);
+            if (!widgetByItemName.has(name)) widgetByItemName.set(name, p);
             hitCollector.push({ key: item.key, node: item.node, type: item.type, widget: p, x: item.x, y: item.y, w: item.w, h: item.h });
         }
     }
@@ -482,6 +506,7 @@ function main() {
     // 变体名 → 目标几何（用于链）
     // 变体内节点名 → 部件 identifier 映射（通过 hitAreas 顺序对齐太脆；用位置最近匹配）
     function matchWidget(v, itemName) {
+        if (widgetByItemName.has(itemName)) return widgetByItemName.get(itemName);
         const item = v.content.get(itemName);
         if (!item) return null;
         // 在全部叶子部件中找位置/尺寸最接近的
@@ -494,7 +519,7 @@ function main() {
             (w.children || []).forEach(walk);
         };
         screenChildren.forEach(walk);
-        return bestD < 80 ? best : null;
+        return bestD < 40 ? best : null;
     }
 
     // 7b) goChain(variant)：动画到该变体的几何/颜色
@@ -545,19 +570,23 @@ function main() {
             if (!w || w.type !== "LVGLLabelWidget") continue;
             const inter = interactions.find(i => i.targetKey && variants.some(vv => vv.key === i.targetKey)) ||
                 { duration: 500, k: 170, c: 15 };
-            comp.actions.push({
-                objID: oid(), action: "animTextColor",
-                object: w.identifier, objectType: "literal",
-                start: 0, startType: "literal",
-                end: hexToInt(item.fill), endType: "literal",
-                delay: 0, delayType: "literal", time: inter.duration, timeType: "literal",
-                instant: false, instantType: "literal",
-                relative: true, relativeType: "literal",
-                path: "SPRING", pathType: "literal",
-                repeatCount: 0, repeatCountType: "literal", playback: false, playbackType: "literal",
-                stiffness: inter.k, stiffnessType: "literal",
-                damping: inter.c, dampingType: "literal"
-            });
+            // 同组联动的符号图标（Figma 里选中组图标跟文字一起变色）
+            const followers = [...iconFollowText.entries()].filter(([, tn]) => tn === nm).map(([wgt]) => wgt);
+            for (const target of [w, ...followers]) {
+                comp.actions.push({
+                    objID: oid(), action: "animTextColor",
+                    object: target.identifier, objectType: "literal",
+                    start: 0, startType: "literal",
+                    end: hexToInt(item.fill), endType: "literal",
+                    delay: 0, delayType: "literal", time: inter.duration, timeType: "literal",
+                    instant: false, instantType: "literal",
+                    relative: true, relativeType: "literal",
+                    path: "SPRING", pathType: "literal",
+                    repeatCount: 0, repeatCountType: "literal", playback: false, playbackType: "literal",
+                    stiffness: inter.k, stiffnessType: "literal",
+                    damping: inter.c, dampingType: "literal"
+                });
+            }
         }
         // 延迟到动画结束再写变量（保护当前位置跟踪）
         const maxTime = Math.max(500, ...comp.actions.map(a => a.time || 0));
