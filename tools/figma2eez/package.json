@@ -1,0 +1,8 @@
+{
+  "name": "figma2eez",
+  "version": "0.1.0",
+  "description": "Figma .fig -> EEZ Studio LVGL project converter (figma2eez)",
+  "dependencies": {
+    "@open-pencil/fig": "*"
+  }
+}
