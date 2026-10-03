@@ -602,49 +602,77 @@ function main() {
         return comp;
     }
 
-    // 7c) 交互源 → 命中区挂 CLICKED + 连线
+    // 7c) 交互源 → 专用命中区（对齐手调金标准模式：透明 CLICKABLE panel
+    // 覆盖交互源的父 FRAME 格，叠在内容之上；同链去重，绝不挂内容部件）
     let screenHandlers = [];
+    // 每个链（变体目标）收集全部交互源的格子 bbox
+    const cellsByChain = new Map();
+    const srcAbsInVariant = startKey => {
+        let x = 0, y = 0, w = 0, h = 0, found = false, first = true;
+        for (let k = startKey; k; ) {
+            const n = nodes.get(k);
+            if (!n) break;
+            if (variants.some(v => v.key === k)) { found = true; break; }
+            const t = n.transform || {};
+            x += t.m02 || 0; y += t.m12 || 0;
+            if (first) { w = (n.size || {}).x || 0; h = (n.size || {}).y || 0; first = false; }
+            const p = n.parentIndex && n.parentIndex.guid;
+            k = p ? G(p) : null;
+        }
+        return found ? { x, y, w, h } : null;
+    };
     for (const it of interactions) {
         if (!it.targetKey || !it.smart) continue;
         const targetVariant = variants.find(v => v.key === it.targetKey);
         if (!targetVariant) continue;
-        const chain = goChain(targetVariant);
-        // 源 hit：key 直配；否则几何回退（源节点在其所属变体内求绝对位置，就近匹配）
-        let hit = hitAreas.find(h => h.key === it.srcKey);
-        if (!hit) {
-            let x = 0, y = 0, found = false;
-            for (let k = it.srcKey; k; ) {
-                const n = nodes.get(k);
-                if (!n) break;
-                if (variants.some(v => v.key === k)) { found = true; break; }
-                const t = n.transform || {};
-                x += t.m02 || 0; y += t.m12 || 0;
-                const p = n.parentIndex && n.parentIndex.guid;
-                k = p ? G(p) : null;
-            }
-            if (found) {
-                let best = null, bestD = 1e9;
-                for (const h of hitAreas) {
-                    const d = Math.abs(h.x - x) + Math.abs(h.y - y);
-                    if (d < bestD) { bestD = d; best = h; }
-                }
-                if (best && bestD < 60) hit = best;
-            }
+        if (it.trigger === "AFTER_TIMEOUT" || it.trigger === "ON_LOAD") {
+            screenHandlers.push({ objID: oid(), eventName: "SCREEN_LOADED", handlerType: "flow", userData: 0 });
+            continue;
         }
-        if (hit) {
-            const w = hit.widget;
-            if (it.trigger === "AFTER_TIMEOUT" || it.trigger === "ON_LOAD") {
-                // 页面加载自动链
-                screenHandlers.push({ objID: oid(), eventName: "SCREEN_LOADED", handlerType: "flow", userData: 0 });
-            } else {
-                if (w.type === "LVGLPanelWidget") {
-                    w.widgetFlags = "CLICKABLE";
-                }
-                w.eventHandlers.push({ objID: oid(), eventName: "CLICKED", handlerType: "flow", userData: 0 });
+        const chain = goChain(targetVariant);
+        // 源格 = 源节点向上最近 FRAME 的 bbox（在变体内绝对坐标）
+        let cell = null;
+        for (let k = it.srcKey; k; ) {
+            const n = nodes.get(k);
+            if (!n) break;
+            if (variants.some(v => v.key === k)) break;
+            if (typeStr(n) === "FRAME") {
+                const box = srcAbsInVariant(k);
+                if (box && box.w > 0) { cell = box; break; }
             }
-            connectionLines.push({ objID: oid(), source: w.objID, output: "CLICKED", target: chain.objID, input: "@seqin" });
-        } else {
-            console.warn(`  [warn] 交互源未映射到部件: ${it.srcNode.name}`);
+            const p = n.parentIndex && n.parentIndex.guid;
+            k = p ? G(p) : null;
+        }
+        if (!cell) {
+            const box = srcAbsInVariant(it.srcKey);
+            cell = box;
+        }
+        if (!cell) { console.warn(`  [warn] 交互源无几何: ${it.srcNode.name}`); continue; }
+        if (!cellsByChain.has(chain.objID)) cellsByChain.set(chain.objID, []);
+        const cells = cellsByChain.get(chain.objID);
+        if (!cells.some(c => Math.abs(c.x - cell.x) < 5 && Math.abs(c.y - cell.y) < 5)) cells.push(cell);
+    }
+    // 命中区横向扩展到相邻格中点（点满整格，对齐 Figma 观感）+ 生成透明 CLICKABLE panel
+    // 全局列界：所有格子按 x 排序，命中区 = 与左右相邻格中点为界（一次性，不叠加）
+    const allCells = [...cellsByChain.values()].flat().slice().sort((a, b) => a.x - b.x);
+    const boundOf = cell => {
+        const i = allCells.indexOf(cell);
+        const left = i > 0 ? Math.round((allCells[i - 1].x + allCells[i - 1].w + cell.x) / 2) : cell.x;
+        const right = i < allCells.length - 1 ? Math.round((cell.x + cell.w + allCells[i + 1].x) / 2) : cell.x + cell.w;
+        return { x0: left, x1: right };
+    };
+    for (const [chainId, cells] of cellsByChain) {
+        const chain = components.find(c => c.objID === chainId);
+        for (const cell of cells) {
+            const { x0, x1 } = boundOf(cell);
+            const hit = panelWidget(uniqId("hit"), x0, cell.y, Math.max(x1 - x0, 8), Math.max(cell.h, 12), { bg_opa: 0 });
+            hit.widgetFlags = "CLICKABLE";
+            hit.eventHandlers.push({ objID: oid(), eventName: "CLICKED", handlerType: "flow", userData: 0 });
+            // 挂到与变体内容同一父级（inst holder 的最后 → 层叠在内容之上）
+            const holder = screenChildren.find(w => w.identifier === "inst") || screenChildren[screenChildren.length - 1];
+            if (holder && holder.children) holder.children.push(hit);
+            else screenChildren.push(hit);
+            connectionLines.push({ objID: oid(), source: hit.objID, output: "CLICKED", target: chainId, input: "@seqin" });
         }
     }
     // 去重 SCREEN_LOADED
