@@ -1468,6 +1468,12 @@ function runV2(args, pageKey, page, ctx, codepoints) {
     const proj = newProject(args, { x: 0, y: 0 }, []);
     proj.userPages = pagesOut;
     proj.variables.globalVariables = globalVars;
+    if (args.noFlow) {
+        // 注意：flowSupport 必须保持 true——F5 Run 预览（wasm 解释器）只认
+        // flow 形态资产，false 会让 Run 黑屏。no-flow 的含义只是"不生成
+        // flow 交互组件"（0 组件 0 连线），画面照常进 Run，交互在 C 文件
+        // 里由 F7 模拟器/固件编译执行。
+    }
     proj.settings.general.displayWidth = pageBox.x;
     proj.settings.general.displayHeight = pageBox.y;
     for (const p of proj.userPages) { p.width = pageBox.x; p.height = pageBox.y; }
