@@ -75,6 +75,9 @@ static void sim_loop(void)
     ui_tick();
 }
 
+/* figma2eez no-flow 工程：由 build_sim 生成 wrapper 强符号覆盖（无则空实现） */
+__attribute__((weak)) void sim_interactions_init(void) {}
+
 int main(void)
 {
     lv_init();
@@ -92,6 +95,7 @@ int main(void)
     emscripten_set_mousemove_callback("#canvas", NULL, 0, on_mouse);
 
     ui_init();
+    sim_interactions_init();
     emscripten_set_main_loop(sim_loop, 30, 1);
     return 0;
 }

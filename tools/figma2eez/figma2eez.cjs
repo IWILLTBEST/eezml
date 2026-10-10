@@ -134,6 +134,196 @@ function strokeInfo(n) {
             return { color: "#" + hex(c.r) + hex(c.g) + hex(c.b), width: Math.round(n.strokeWeight) };
         }
     }
+    // 渐变描边 → 取首停色近似（LVGL border 无渐变；描边环/弧先可见再谈保真）
+    for (const f of n.strokePaints || []) {
+        if (f && (f.type || "").startsWith("GRADIENT") && f.stops && f.stops.length && f.visible !== false && n.strokeWeight) {
+            const c = f.stops[0].color;
+            const hex = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, "0").toUpperCase();
+            return { color: "#" + hex(c.r) + hex(c.g) + hex(c.b), width: Math.round(n.strokeWeight), gradApprox: true };
+        }
+    }
+    return null;
+}
+
+// ---------- 位图（.fig 内嵌 PNG 原样提取，零猜测）----------
+// PNG IHDR 宽高（签名8+len4+"IHDR"4=16 偏移，big-endian；DataView 兼容任意 typed array）
+function pngSize(buf) {
+    if (!buf || buf.length < 24 || buf[0] !== 0x89 || buf[1] !== 0x50) return null;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    return { w: dv.getUint32(16), h: dv.getUint32(20) };
+}
+function imagePaint(n) {
+    for (const f of n.fillPaints || []) {
+        if (f && f.type === "IMAGE" && f.visible !== false && f.image && f.image.hash) return f;
+    }
+    return null;
+}
+const hashHex = h => Buffer.from(h).toString("hex");
+// PNG 预缩放（box 平均=缩小抗锯齿；LVGL img zoom 是近邻采样，缩小必马赛克，
+// 所以位图在转换期就重采样到节点精确尺寸，zoom 恒 256 走原生像素）
+let PngJS = null;
+function resamplePng(pngBuf, tw, th) {
+    try {
+        if (!PngJS) PngJS = require(path.join(__dirname, "node_modules", "pngjs"));
+        const img = PngJS.PNG.sync.read(Buffer.from(pngBuf));
+        const sw = img.width, sh = img.height;
+        if (sw === tw && sh === th) return Buffer.from(pngBuf);
+        const out = new PngJS.PNG({ width: tw, height: th });
+        // RGBA box 平均：sx/sy 累积权重精确处理非整数倍
+        const wAcc = new Float64Array(tw * th * 4);
+        const x0s = [], x1s = [], y0s = [], y1s = [];
+        for (let x = 0; x < tw; x++) { x0s[x] = x * sw / tw; x1s[x] = (x + 1) * sw / tw; }
+        for (let y = 0; y < th; y++) { y0s[y] = y * sh / th; y1s[y] = (y + 1) * sh / th; }
+        for (let ty = 0; ty < th; ty++) {
+            for (let tx = 0; tx < tw; tx++) {
+                let r = 0, g = 0, b = 0, a = 0, wsum = 0;
+                const sy0 = y0s[ty], sy1 = y1s[ty], sx0 = x0s[tx], sx1 = x1s[tx];
+                for (let sy = Math.floor(sy0); sy < Math.min(Math.ceil(sy1), sh); sy++) {
+                    const wy = Math.min(sy + 1, sy1) - Math.max(sy, sy0);
+                    if (wy <= 0) continue;
+                    for (let sx = Math.floor(sx0); sx < Math.min(Math.ceil(sx1), sw); sx++) {
+                        const wx = Math.min(sx + 1, sx1) - Math.max(sx, sx0);
+                        if (wx <= 0) continue;
+                        const wgt = wx * wy;
+                        const si = (sy * sw + sx) * 4;
+                        // 预乘 alpha 平均（透明边缘不发黑）
+                        const al = img.data[si + 3] / 255;
+                        r += img.data[si] * al * wgt; g += img.data[si + 1] * al * wgt;
+                        b += img.data[si + 2] * al * wgt; a += img.data[si + 3] * wgt;
+                        wsum += wgt;
+                    }
+                }
+                if (wsum > 0) { r /= wsum; g /= wsum; b /= wsum; a /= wsum; }
+                const di = (ty * tw + tx) * 4;
+                const aN = a / 255;
+                out.data[di] = Math.round(aN > 0 ? r / aN : 0);
+                out.data[di + 1] = Math.round(aN > 0 ? g / aN : 0);
+                out.data[di + 2] = Math.round(aN > 0 ? b / aN : 0);
+                out.data[di + 3] = Math.round(a);
+            }
+        }
+        return PngJS.PNG.sync.write(out);
+    } catch (e) {
+        console.warn(`  [warn] PNG 预缩放失败（${e.message}），保留原尺寸`);
+        return Buffer.from(pngBuf);
+    }
+}
+// 等比 cover 居中裁剪（对齐 Figma FILL 语义）再缩放到节点精确尺寸
+function coverCropPng(pngBuf, tw, th) {
+    try {
+        if (!PngJS) PngJS = require(path.join(__dirname, "node_modules", "pngjs"));
+        const img = PngJS.PNG.sync.read(Buffer.from(pngBuf));
+        const sw = img.width, sh = img.height;
+        const scale = Math.max(tw / sw, th / sh);
+        const cw = Math.min(sw, Math.round(tw / scale)), ch = Math.min(sh, Math.round(th / scale));
+        const cx = Math.floor((sw - cw) / 2), cy = Math.floor((sh - ch) / 2);
+        const cropped = new PngJS.PNG({ width: cw, height: ch });
+        for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+            const si = ((cy + y) * sw + (cx + x)) * 4, di = (y * cw + x) * 4;
+            for (let k = 0; k < 4; k++) cropped.data[di + k] = img.data[si + k];
+        }
+        return resamplePng(PngJS.PNG.sync.write(cropped), tw, th);
+    } catch (e) {
+        return Buffer.from(pngBuf);
+    }
+}
+// 注册表：hash+WxH → { name, w, h }；同图多档位（卡角 17..24/右屏 36/46）各一条
+function makeBitmapRegistry(ctx) {
+    const byKey = new Map(); // "hash_WxH" → rec（同图多档位各一条，档位=节点精确尺寸）
+    const images = new Map(((ctx.raw || {}).images || []).map(e => [e[0], e[1]]));
+    const reg = {
+        bitmaps: [],
+        register(paint, nodeW, nodeH) {
+            const hash = hashHex(paint.image.hash);
+            const tw = Math.max(2, Math.round(nodeW || 0)), th = Math.max(2, Math.round(nodeH || 0));
+            const key = `${hash}_${tw}x${th}`;
+            if (byKey.has(key)) return byKey.get(key);
+            const png = images.get(hash);
+            if (!png) {
+                console.warn(`  [warn] IMAGE ${hash.slice(0, 8)}… 不在 archive images 表，跳过`);
+                byKey.set(key, null);
+                return null;
+            }
+            const sz = pngSize(png) || { w: 0, h: 0 };
+            const name = "img_" + hash.slice(0, 8) + "_" + tw + "x" + th;
+            // 预缩放/预裁剪到节点尺寸（等比则直接重采样；不等比按 FILL cover 裁剪）。
+            // zoom 恒 256：LVGL img zoom 近邻采样，缩小必马赛克。
+            let data = png;
+            let mode = "原尺寸";
+            if (sz.w && sz.h) {
+                const nearUniform = Math.abs(tw / sz.w - th / sz.h) <= Math.max(tw / sz.w, th / sz.h) * 0.2;
+                if (nearUniform && sz.w !== tw) { data = resamplePng(png, tw, th); mode = `${sz.w}x${sz.h}→${tw}x${th}`; }
+                else if (!nearUniform) { data = coverCropPng(png, tw, th); mode = `cover ${sz.w}x${sz.h}→${tw}x${th}`; }
+            }
+            reg.bitmaps.push({
+                objID: oid(), name,
+                image: "data:image/png;base64," + Buffer.from(data).toString("base64"),
+                bpp: 32, alwaysBuild: false, lvglBinaryOutputFormat: 3, lvglDither: false
+            });
+            const rec = { name, w: tw, h: th };
+            byKey.set(key, rec);
+            console.log(`  [bitmap] ${name} ${mode} (${(data.length / 1024).toFixed(1)}KB)`);
+            return rec;
+        }
+    };
+    return reg;
+}
+
+// ---------- 图标符号（Material Symbols Rounded，码位查 msr-codepoints.txt）----------
+// 发射时用 iconsym 字体（--fonts-from 模板的 MSR 字体克隆一条小字号条目，
+// lvglSymbols 只收实际用到的字符；MONTSERRAT 内置字体不含 FontAwesome 区，
+// 小字号直接用内置字体=方块）
+const VECTOR_SYMBOL_NAMES = {
+    left: "chevron_left", right: "chevron_right", up: "expand_less", down: "expand_more",
+    back: "arrow_back",
+    close: "close", check: "check", plus: "add", minus: "remove",
+    play: "play_arrow", pause: "pause", stop: "stop", prev: "skip_previous", next: "skip_next",
+    refresh: "refresh", settings: "settings", search: "search", home: "home",
+    heart: "favorite", heartrate: "monitor_heart", trash: "delete", edit: "edit",
+    eye: "visibility", warning: "warning", question: "help", info: "info",
+    bluetooth: "bluetooth", wifi: "wifi", volume: "volume_up",
+    bell: "notifications", gps: "my_location"
+};
+// VECTOR 名 → 符号名（方向按宽高比：瘦高=left/right，扁宽=up/down）
+function vectorSymbol(n, w, h) {
+    const nm = (n.name || "").toLowerCase();
+    if (/up|north/.test(nm) && /arrow|chevron/.test(nm)) return VECTOR_SYMBOL_NAMES.up;
+    if (/down|south/.test(nm) && /arrow|chevron/.test(nm)) return VECTOR_SYMBOL_NAMES.down;
+    if (/arrow|chevron|back|previous/.test(nm)) return w <= h ? VECTOR_SYMBOL_NAMES.left : VECTOR_SYMBOL_NAMES.right;
+    if (/play/.test(nm)) return VECTOR_SYMBOL_NAMES.play;
+    if (/pause/.test(nm)) return VECTOR_SYMBOL_NAMES.pause;
+    if (/heart/.test(nm)) return VECTOR_SYMBOL_NAMES.heart;
+    if (/settings|gear/.test(nm)) return VECTOR_SYMBOL_NAMES.settings;
+    if (/search|magnif/.test(nm)) return VECTOR_SYMBOL_NAMES.search;
+    if (/close|cancel/.test(nm)) return VECTOR_SYMBOL_NAMES.close;
+    if (/check/.test(nm)) return VECTOR_SYMBOL_NAMES.check;
+    if (/bell|notif/.test(nm)) return VECTOR_SYMBOL_NAMES.bell;
+    if (/bluetooth/.test(nm)) return VECTOR_SYMBOL_NAMES.bluetooth;
+    if (/wifi/.test(nm)) return VECTOR_SYMBOL_NAMES.wifi;
+    return null;
+}
+// 兄弟数值文本旁的无名小矢量（Icon + "00:12"）→ 活动度量符号（心率等）。
+// 图标常包在 Glyph/Icon 包装 FRAME 里，数值文本在祖父级——向上查两级。
+function siblingMetricSymbol(n, kids, nodes) {
+    const w = (n.size || {}).x || 0, h = (n.size || {}).y || 0;
+    if (w > 20 || h > 20) return null;
+    const nm = (n.name || "").toLowerCase();
+    if (!/icon|duration|time|activity|pulse|rate/.test(nm)) return null;
+    const parentKeyOf = node => {
+        const g = node && node.parentIndex && node.parentIndex.guid;
+        return g ? G(g) : null;
+    };
+    let scope = parentKeyOf(n);
+    for (let depth = 0; depth < 2 && scope; depth++) {
+        const hasNumSibling = (kids.get(scope) || []).some(ck => {
+            const cn = nodes.get(ck);
+            if (cn === n) return false;
+            const chars = ((cn && cn.textData) || {}).characters || "";
+            return typeStr(cn) === "TEXT" && /\d/.test(chars);
+        });
+        if (hasNumSibling) return VECTOR_SYMBOL_NAMES.heart; // 实心心形贴近设计原版（monitor_heart 是描边盒样式）
+        scope = parentKeyOf(nodes.get(scope) || {});
+    }
     return null;
 }
 const hexToInt = c => c ? parseInt(c.slice(1, 7), 16) : 0x191919;
@@ -160,6 +350,13 @@ const sanitize = (name, prefix) => {
     if (/^\d/.test(s)) s = "Screen" + s;
     return s;
 };
+// Figma 文本水平对齐（kiwi proto 默认值省略：无字段=LEFT）
+function figTextAlign(n) {
+    const td = n.textData || {};
+    const src = (td.styleOverrideTable && td.styleOverrideTable.length && td.styleOverrideTable[0].textAlignHorizontal) ||
+        td.textAlignHorizontal || (td.style && td.style.textAlignHorizontal);
+    return { L: "LEFT", C: "CENTER", R: "RIGHT", J: "LEFT", LEFT: "LEFT", CENTER: "CENTER", RIGHT: "RIGHT", JUSTIFIED: "LEFT" }[src] || "LEFT";
+}
 
 // ---------- EEZ 部件工厂（全默认字段，血泪教训全在内） ----------
 let oidCounter = 0;
@@ -204,6 +401,24 @@ function labelWidget(id, x, y, w, h, text, styleProps) {
         widgetFlags: DECOR_FLAGS,
         localStyles: { objID: oid(), definition: { MAIN: { DEFAULT: Object.assign({ text_align: "CENTER" }, styleProps) } } }
     });
+}
+
+function imageWidget(id, x, y, w, h, bitmapName, zoom, radius) {
+    const styleDef = radius > 0 ? { MAIN: { DEFAULT: { radius: Math.round(radius), clip_corner: true } } } : {};
+    return makeWidget("LVGLImageWidget", {
+        identifier: id, left: Math.round(x), top: Math.round(y),
+        width: Math.round(Math.max(w, 4)), height: Math.round(Math.max(h, 4)),
+        image: bitmapName, setPivot: false, pivotX: 0, pivotY: 0,
+        zoom: Math.round(zoom || 256), angle: 0, innerAlign: "CENTER",
+        widgetFlags: DECOR_FLAGS,
+        localStyles: { objID: oid(), definition: styleDef }
+    });
+}
+// Figma cornerRadius → 像素圆角（1000 等哨兵值=全圆；node 无值时矩形）
+function imgRadius(n, w, h) {
+    const cr = n.cornerRadius;
+    if (!cr || cr <= 0) return 0;
+    return Math.min(cr, Math.min(w, h) / 2);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -257,6 +472,9 @@ function applyFontsFrom(proj, fontUse, args) {
             console.warn(`  [warn] 含中文文本 ${[...new Set([].concat(...cjkNeeds.map(([, s]) => [...s])))].join("")} —— 需要 CJK 字体：`);
             console.warn("        经 MCP 桥 add_font 生成（ttc 需先提 ttf），或 --fonts-from 模板工程复制，否则中文不显示");
         }
+        const symChars = fontUse.get("iconsym");
+        if (symChars && symChars.size) console.warn(`  [warn] 图标符号 ${[...symChars].join("")} 需要 --fonts-from 模板（MaterialSymbols 字体）才能渲染，否则符号为空`);
+        for (const [k] of fontUse) if (k.startsWith("iconsym_")) console.warn(`  [warn] 图标符号档位 ${k} 需要 --fonts-from 模板（MaterialSymbols 字体），否则符号不显示`);
         return;
     }
     try {
@@ -271,6 +489,41 @@ function applyFontsFrom(proj, fontUse, args) {
                     const best = cjkFonts.reduce((a, b) => Math.abs((b.source?.size || 15) - size) < Math.abs((a.source?.size || 15) - size) ? b : a);
                     remap[k] = best.name;
                 }
+            }
+        }
+        // iconsym_<size>：按图标几何分档克隆 MSR 字体（每档一条，字号=档位，
+        // lvglSymbols=该档用到的字符）。embeddedFontFile（内嵌 TTF base64）
+        // 原样保留，构建时 lv_font_conv 重出字形。
+        const symTiers = [...fontUse.entries()].filter(([k]) => k.startsWith("iconsym_"));
+        if (symTiers.length) {
+            const msr = (tpl.fonts || []).find(f => /msr|materialsymbols|material[-_]?symbols/i.test(f.name) ||
+                (f.source && /MaterialSymbols/i.test(f.source.filePath || "")));
+            if (msr && msr.embeddedFontFile) {
+                for (const [tier, chars] of symTiers) {
+                    const size = parseInt(tier.split("_")[1]) || 16;
+                    const symbols = [...chars].join("");
+                    const clone = JSON.parse(JSON.stringify(Object.assign({}, msr, {
+                        name: tier,
+                        source: Object.assign({}, msr.source, { size }),
+                        size,
+                        lvglRanges: "",
+                        lvglSymbols: symbols,
+                        lvglGlyphs: { encodings: [], symbols }
+                    })));
+                    clone.objID = oid();
+                    if (clone.source) clone.source.objID = oid();
+                    // 预览元数据按新字号重算（height=em 高度近似 size+4）
+                    clone.height = size + 4;
+                    if (msr.height > 0) {
+                        const k = clone.height / msr.height;
+                        clone.ascent = Math.round((msr.ascent || Math.round(msr.height * 0.78)) * k);
+                        clone.descent = Math.max(0, clone.height - clone.ascent);
+                    }
+                    proj.fonts.push(clone);
+                    console.log(`字体: ${tier} = MSR ${size}px 符号 ${symbols.length} 字符（${[...chars].map(c => "U+" + c.codePointAt(0).toString(16)).join(" ")}）`);
+                }
+            } else {
+                console.warn("  [warn] 模板无 MaterialSymbols 字体（需 embeddedFontFile），图标符号将不渲染");
             }
         }
         const remapFont = w => {
@@ -799,7 +1052,10 @@ function newProject(args, box, variables) {
                 configurations: [{ objID: oid(), name: "Default" }],
                 files: LVGL_BUILD_FILE_TEMPLATES,
                 destinationFolder: "src",
-                imageExportMode: "source"
+                imageExportMode: "source",
+                // F7 模拟器链（emcc）依赖 eez-framework amalgamation 产物（eez-flow.cpp
+                // + eez/ 头），不开则 src/ 缺框架、模拟器编译炸 eez/flow/lvgl_api.h
+                generateSourceCodeForEezFramework: true
             }
         },
         themes: [{ objID: oid(), name: "Default", colors: [] }],
@@ -825,6 +1081,7 @@ const PUSH_TO_FADE = {
 
 function runV2(args, pageKey, page, ctx, codepoints) {
     const { nodes, order, kids } = ctx;
+    const bitmapReg = makeBitmapRegistry(ctx);
 
     // ---- 帧与交互收集 ----
     const frameKeys = (kids.get(pageKey) || []).filter(k => typeStr(nodes.get(k)) === "FRAME");
@@ -989,21 +1246,53 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             });
             console.log(`  [inst ${instNode.name}] leaves=${ex.leaves.length} ovHits=${hit} ovsSize=${ex.ovs.size} texts=${texts.join("|")}`);
         }
-        let li = 0;
+        let li = 0, ii = 0;
+        const emittedImgs = new Set(); // 同 hash 同位置多层叠图去重
         for (const lf of ex.leaves) {
             if (lf === ex.face) continue;
-            if (lf.type !== "TEXT") continue; // 其余叶子（Icon 矢量/角标位图）暂不渲染
-            const ov = ex.ovs.get(lf.key) || {};
-            const chars = (ov.textData && ov.textData.characters) || ((lf.node.textData || {}).characters) || "";
-            if (!chars) continue;
-            const x = lf.x * ex.sx, y = lf.y * ex.sy;
-            const w = lf.w * ex.sx, h = lf.h * ex.sy;
-            const fill = solidFill({ fillPaints: (ov.fillPaints || lf.node.fillPaints || []) }) || "#FFFFFF";
-            const { font } = textFont(lf.node.fontSize, chars);
-            const opa = ov.opacity !== undefined ? ov.opacity : (lf.node.opacity !== undefined ? lf.node.opacity : 1);
-            const style = { text_color: fill, text_font: font };
-            if (opa < 1) style.text_opa = Math.round(opa * 255);
-            holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y, Math.max(w, 12), Math.max(h, 14), chars, style));
+            if (lf.type === "TEXT") {
+                const ov = ex.ovs.get(lf.key) || {};
+                const chars = (ov.textData && ov.textData.characters) || ((lf.node.textData || {}).characters) || "";
+                if (!chars) continue;
+                const x = lf.x * ex.sx, y = lf.y * ex.sy;
+                const w = lf.w * ex.sx, h = lf.h * ex.sy;
+                const fill = solidFill({ fillPaints: (ov.fillPaints || lf.node.fillPaints || []) }) || "#FFFFFF";
+                const { font } = textFont(lf.node.fontSize, chars);
+                const opa = ov.opacity !== undefined ? ov.opacity : (lf.node.opacity !== undefined ? lf.node.opacity : 1);
+                const style = { text_color: fill, text_font: font, text_align: figTextAlign(lf.node) };
+                if (opa < 1) style.text_opa = Math.round(opa * 255);
+                holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y, Math.max(w, 12), Math.max(h, 14), chars, style));
+            } else if (lf.type === "VECTOR") {
+                // 小图标矢量 → MSR 符号（名匹配或数值伴生推断）；字号=图标几何分档
+                const sym = vectorSymbol(lf.node, lf.w, lf.h) || siblingMetricSymbol(lf.node, kids, nodes);
+                if (!sym || !codepoints[sym]) continue;
+                const symCh = String.fromCodePoint(codepoints[sym]);
+                const x = lf.x * ex.sx, y = lf.y * ex.sy;
+                const w = lf.w * ex.sx, h = lf.h * ex.sy;
+                const fsz = Math.max(8, Math.min(16, Math.round(Math.max(w, h))));
+                const fname = "iconsym_" + fsz;
+                if (!fontUse.has(fname)) fontUse.set(fname, new Set());
+                fontUse.get(fname).add(symCh);
+                const iw2 = Math.max(fsz + 2, 12), ih2 = Math.max(fsz + 2, 12);
+                const fill = solidFill({ fillPaints: ((ex.ovs.get(lf.key) || {}).fillPaints || lf.node.fillPaints || []) }) || "#FFFFFF";
+                holder.children.push(labelWidget(uniqId(`${baseId}_s${ii++}`), x - (iw2 - w) / 2, y - (ih2 - h) / 2, iw2, ih2, symCh,
+                    { text_color: fill, text_font: fname }));
+            } else if (["RECTANGLE", "ROUNDED_RECTANGLE", "ELLIPSE"].includes(lf.type)) {
+                // IMAGE 填充叶 → 位图部件（卡角图标等）；覆盖表可能换图
+                const ov = ex.ovs.get(lf.key) || {};
+                const paints = (ov.fillPaints && ov.fillPaints.length ? ov.fillPaints : lf.node.fillPaints) || [];
+                const imgP = imagePaint({ fillPaints: paints });
+                if (!imgP) continue;
+                const hkey = hashHex(imgP.image.hash) + "@" + Math.round(lf.x) + "," + Math.round(lf.y);
+                if (emittedImgs.has(hkey)) continue;
+                const x = lf.x * ex.sx, y = lf.y * ex.sy;
+                const w = lf.w * ex.sx, h = lf.h * ex.sy;
+                const bmp = bitmapReg.register(imgP, w, h);
+                if (!bmp) continue;
+                emittedImgs.add(hkey);
+                holder.children.push(imageWidget(uniqId(`${baseId}_i${ii++}`), x, y, w, h, bmp.name,
+                    256, imgRadius(lf.node, w, h)));
+            }
         }
     }
 
@@ -1035,7 +1324,37 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             else style.bg_opa = 0;
             const p = panelWidget(id, x, y, w, h, style);
             out.push(p);
-            for (const c of kids.get(k) || []) emitStaticNode(c, 0, 0, p.children, skipKeys);
+            // 同位同图位图叶只留 parentIndex 最上一层（Figma 底图常复制两层做效果，
+            // 叠两遍除浪费外还可能与 zoom 重采样产生重影）
+            const topImg = new Map(); // 签名 → 最上层 key（kids 序=层序，同签名后者覆盖）
+            for (const c of kids.get(k) || []) {
+                const cn = nodes.get(c);
+                if (!cn || cn.visible === false) continue;
+                const ip = imagePaint(cn);
+                if (!ip) continue;
+                const ct = cn.transform || {};
+                topImg.set(`${hashHex(ip.image.hash)}@${Math.round(ct.m02 || 0)},${Math.round(ct.m12 || 0)},${Math.round((cn.size || {}).x || 0)},${Math.round((cn.size || {}).y || 0)}`, c);
+            }
+            const dupImgKeys = new Set(); if (process.env.F2E_DEBUG) console.log(`    [dedup-scan] FRAME `+`"${n.name}" children=${(kids.get(k)||[]).length} topImgSigs=${topImg.size}`);
+            for (const [sig, topKey] of topImg) {
+                const sigHash = sig.split("@")[0];
+                const [, geo] = sig.split("@");
+                const [gx, gy, gw, gh] = geo.split(",").map(Number);
+                for (const sib of kids.get(k) || []) {
+                    if (sib === topKey) break;
+                    const sn = nodes.get(sib);
+                    if (!sn || sn.visible === false) continue;
+                    const sp = imagePaint(sn);
+                    if (!sp || hashHex(sp.image.hash) !== sigHash) continue;
+                    const st = sn.transform || {};
+                    if (Math.round(st.m02 || 0) === gx && Math.round(st.m12 || 0) === gy &&
+                        Math.round((sn.size || {}).x || 0) === gw && Math.round((sn.size || {}).y || 0) === gh) dupImgKeys.add(sib);
+                }
+            }
+            if (process.env.F2E_DEBUG && dupImgKeys.size) console.log(`    [dedup] "${n.name}" 去重 ${dupImgKeys.size} 层`);
+            for (const c of kids.get(k) || []) {
+                emitStaticNode(c, x, y, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null));
+            }
             return p;
         }
         if (ty === "TEXT") {
@@ -1044,7 +1363,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             const fill = solidFill(n) || "#191919";
             const { font } = textFont(n.fontSize, chars);
             const opa = n.opacity !== undefined ? n.opacity : 1;
-            const style = { text_color: fill, text_font: font };
+            const style = { text_color: fill, text_font: font, text_align: figTextAlign(n) };
             if (opa < 1) style.text_opa = Math.round(opa * 255);
             const lbl = labelWidget(id, x, y, Math.max(w, 12), Math.max(h, 14), chars, style);
             out.push(lbl);
@@ -1052,9 +1371,36 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         }
         if (ty === "VECTOR" || ty === "LINE") {
             const nm = (n.name || "").toLowerCase();
+            const imgP = imagePaint(n);
+            if (imgP) {
+                const bmp = bitmapReg.register(imgP, w, h);
+                if (bmp) {
+                    const iw = imageWidget(id, x, y, w, h, bmp.name, 256, imgRadius(n, w, h));
+                    out.push(iw);
+                    return iw;
+                }
+                return null;
+            }
+            const sym = vectorSymbol(n, w, h) || siblingMetricSymbol(n, kids, nodes);
+            const symCh = sym && codepoints[sym] ? String.fromCodePoint(codepoints[sym]) : null;
+            if (symCh) {
+                const fsz = Math.max(8, Math.min(16, Math.round(Math.max(w, h))));
+                const fname = "iconsym_" + fsz;
+                if (!fontUse.has(fname)) fontUse.set(fname, new Set());
+                fontUse.get(fname).add(symCh);
+                const fill = solidFill(n) || "#191919";
+                const iw2 = Math.max(fsz + 2, 12), ih2 = Math.max(fsz + 2, 12);
+                // 居中补偿：label 框放大后几何中心对齐节点中心
+                const lbl = labelWidget(id, x - (iw2 - w) / 2, y - (ih2 - h) / 2, iw2, ih2, symCh,
+                    { text_color: fill, text_font: fname });
+                out.push(lbl);
+                return lbl;
+            }
             const fill = solidFill(n);
             const stroke = strokeInfo(n);
             if (!fill && !stroke) return null;
+            // 小实心矢量：仅圆点/圆类按圆 panel 渲染，其余（闪电等异形）不画假方块
+            if (!stroke && w <= 16 && h <= 16 && !/dot|circle|oval|ellipse/.test(nm)) return null;
             const nearSquare = Math.abs(w - h) <= Math.max(w, h) * 0.15;
             const radius = nearSquare || /oval|circle|ellipse|dot/.test(nm) ? Math.round(Math.min(w, h) / 2) : Math.round(n.cornerRadius || 0);
             const style = Object.assign({},
@@ -1067,6 +1413,16 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             return p;
         }
         if (["RECTANGLE", "ROUNDED_RECTANGLE", "ELLIPSE", "STAR", "POLYGON", "BOOLEAN_OPERATION"].includes(ty)) {
+            const imgP = imagePaint(n);
+            if (imgP) {
+                const bmp = bitmapReg.register(imgP, w, h);
+                if (bmp) {
+                    const iw = imageWidget(id, x, y, w, h, bmp.name, 256, imgRadius(n, w, h));
+                    out.push(iw);
+                    return iw;
+                }
+                return null;
+            }
             const fill = solidFill(n);
             const opa = fillOpa(n);
             const stroke = strokeInfo(n);
@@ -1209,6 +1565,25 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         // ghost panels（每状态一块，state0 可见其余 HIDDEN；顶层叠放）
         const ghosts = ghostDefs.map(gd => {
             const lf = gd.leaf0;
+            // 符号矢量（箭头等）→ label ghost：形状用 MSR 符号，每状态一块按色切换
+            const symName = vectorSymbol(lf.node, lf.w, lf.h) || siblingMetricSymbol(lf.node, kids, nodes);
+            const symCh = symName && codepoints[symName] ? String.fromCodePoint(codepoints[symName]) : null;
+            if (symCh) {
+                const fsz = Math.max(8, Math.min(16, Math.round(Math.max(lf.w, lf.h))));
+                const fname = "iconsym_" + fsz;
+                if (!fontUse.has(fname)) fontUse.set(fname, new Set());
+                fontUse.get(fname).add(symCh);
+                const iw2 = Math.max(fsz + 2, 12), ih2 = Math.max(fsz + 2, 12);
+                const panels = gd.perStateFill.map((fill, si) => {
+                    const lbl = labelWidget(uniqId(`ghost_${sanitize(gd.item.name + lf.path, "g")}_${si}`),
+                        lf.x - (iw2 - lf.w) / 2, lf.y - (ih2 - lf.h) / 2, iw2, ih2, symCh,
+                        { text_color: fill || "#191919", text_font: fname });
+                    if (si > 0) lbl.widgetFlags = (lbl.widgetFlags ? lbl.widgetFlags + "|" : "") + "HIDDEN";
+                    screenChildren.push(lbl);
+                    return lbl;
+                });
+                return { panels, name: gd.item.name + lf.path };
+            }
             const nearSquare = Math.abs(lf.w - lf.h) <= Math.max(lf.w, lf.h) * 0.15;
             const radius = nearSquare ? Math.round(Math.min(lf.w, lf.h) / 2) : 0;
             const panels = gd.perStateFill.map((fill, si) => {
@@ -1466,6 +1841,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
     });
 
     const proj = newProject(args, { x: 0, y: 0 }, []);
+    proj.bitmaps.push(...bitmapReg.bitmaps);
     proj.userPages = pagesOut;
     proj.variables.globalVariables = globalVars;
     if (args.noFlow) {
@@ -1691,9 +2067,9 @@ function runV2(args, pageKey, page, ctx, codepoints) {
 // ---------- 主流程 ----------
 function main() {
     const args = parseArgs(process.argv);
-    const { nodes, order } = parseFig(args._[0]);
+    const { raw, nodes, order } = parseFig(args._[0]);
     const { kids } = buildTree({ nodes, order });
-    const ctx = { nodes, order, kids };
+    const ctx = { raw, nodes, order, kids };
     const codepoints = loadCodepoints();
 
     const pages = order.map(k => nodes.get(k)).filter(n => typeStr(n) === "CANVAS");
