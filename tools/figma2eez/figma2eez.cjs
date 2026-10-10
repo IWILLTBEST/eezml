@@ -393,13 +393,20 @@ function panelWidget(id, x, y, w, h, styleProps, flags) {
     });
 }
 
-function labelWidget(id, x, y, w, h, text, styleProps) {
+function labelWidget(id, x, y, w, h, text, styleProps, opts) {
+    const fsz = (opts && opts.fontSize) || 16;
+    const singleLine = !(text || "").includes("\n") && h <= fsz * 1.7;
+    // 单行短文本 → 宽度自适应内容（渲染字体比 Inter 宽，定宽+WRAP 会截断换行）。
+    // 不能用 longMode DOT/CLIP：LVGL 9.4 枚举改名 LV_LABEL_LONG_MODE_*，
+    // Studio 生成的 LV_LABEL_LONG_<value> 在 9.4 编不过——content 宽不换行，无此依赖
+    const units = singleLine ? { widthUnit: "content", heightUnit: "content" } : {};
     return makeWidget("LVGLLabelWidget", {
         identifier: id, left: Math.round(x), top: Math.round(y),
         width: Math.round(w), height: Math.round(h),
         text, textType: "literal", longMode: "WRAP", // 缺省即炸：C 导出会拼 LV_LABEL_LONG_<undefined>
         widgetFlags: DECOR_FLAGS,
-        localStyles: { objID: oid(), definition: { MAIN: { DEFAULT: Object.assign({ text_align: "CENTER" }, styleProps) } } }
+        ...units,
+        localStyles: { objID: oid(), definition: { MAIN: { DEFAULT: Object.assign({ text_align: "CENTER" }, styleProps || {}) } } }
     });
 }
 
@@ -1247,7 +1254,23 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             console.log(`  [inst ${instNode.name}] leaves=${ex.leaves.length} ovHits=${hit} ovsSize=${ex.ovs.size} texts=${texts.join("|")}`);
         }
         let li = 0, ii = 0;
-        const emittedImgs = new Set(); // 同 hash 同位置多层叠图去重
+        // 同位置 IMAGE 叶的选择：实例覆盖层 > 母版层（覆盖语义=换图）。Smart Animate
+        // 官方渲染是动画终态（母版层淡出），静态 .fig 查不到 opacity 动画，按覆盖
+        // 优先近似；同档内取 z 最高。跨档/跨实例各自成图，hash 不同即不同 bitmap
+        const topImgLeaf = new Map(); // "x,y,w,h" → { leaf, covered }
+        for (const lf of ex.leaves) {
+            if (lf === ex.face) continue;
+            if (!["RECTANGLE", "ROUNDED_RECTANGLE", "ELLIPSE"].includes(lf.type)) continue;
+            const ov = ex.ovs.get(lf.key) || {};
+            const paints = (ov.fillPaints && ov.fillPaints.length ? ov.fillPaints : lf.node.fillPaints) || [];
+            const imgP = imagePaint({ fillPaints: paints });
+            if (!imgP) continue;
+            const sig = `${Math.round(lf.x)},${Math.round(lf.y)},${Math.round(lf.w)},${Math.round(lf.h)}`;
+            const covered = !!(ov.fillPaints && ov.fillPaints.length && imagePaint({ fillPaints: ov.fillPaints }));
+            const prev = topImgLeaf.get(sig);
+            // covered 优先；同档取后出现的（z 高）
+            if (!prev || (covered && !prev.covered) || (covered === prev.covered)) topImgLeaf.set(sig, { leaf: lf, covered });
+        }
         for (const lf of ex.leaves) {
             if (lf === ex.face) continue;
             if (lf.type === "TEXT") {
@@ -1261,7 +1284,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 const opa = ov.opacity !== undefined ? ov.opacity : (lf.node.opacity !== undefined ? lf.node.opacity : 1);
                 const style = { text_color: fill, text_font: font, text_align: figTextAlign(lf.node) };
                 if (opa < 1) style.text_opa = Math.round(opa * 255);
-                holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y, Math.max(w, 12), Math.max(h, 14), chars, style));
+                holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y, Math.max(w, 12), Math.max(h, 14), chars, style, { fontSize: lf.node.fontSize || 12 }));
             } else if (lf.type === "VECTOR") {
                 // 小图标矢量 → MSR 符号（名匹配或数值伴生推断）；字号=图标几何分档
                 const sym = vectorSymbol(lf.node, lf.w, lf.h) || siblingMetricSymbol(lf.node, kids, nodes);
@@ -1278,20 +1301,22 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 holder.children.push(labelWidget(uniqId(`${baseId}_s${ii++}`), x - (iw2 - w) / 2, y - (ih2 - h) / 2, iw2, ih2, symCh,
                     { text_color: fill, text_font: fname }));
             } else if (["RECTANGLE", "ROUNDED_RECTANGLE", "ELLIPSE"].includes(lf.type)) {
-                // IMAGE 填充叶 → 位图部件（卡角图标等）；覆盖表可能换图
+                // 同位多层：只发选中的那层（覆盖优先，见 topImgLeaf 规则）
+                const sig = `${Math.round(lf.x)},${Math.round(lf.y)},${Math.round(lf.w)},${Math.round(lf.h)}`;
+                const chosen = topImgLeaf.get(sig);
+                if (!chosen || chosen.leaf !== lf) continue;
                 const ov = ex.ovs.get(lf.key) || {};
                 const paints = (ov.fillPaints && ov.fillPaints.length ? ov.fillPaints : lf.node.fillPaints) || [];
                 const imgP = imagePaint({ fillPaints: paints });
                 if (!imgP) continue;
-                const hkey = hashHex(imgP.image.hash) + "@" + Math.round(lf.x) + "," + Math.round(lf.y);
-                if (emittedImgs.has(hkey)) continue;
                 const x = lf.x * ex.sx, y = lf.y * ex.sy;
                 const w = lf.w * ex.sx, h = lf.h * ex.sy;
                 const bmp = bitmapReg.register(imgP, w, h);
                 if (!bmp) continue;
-                emittedImgs.add(hkey);
+                // 圆角读覆盖值优先（Overlay 层的 cornerRadius 覆盖=圆形哨兵 1000）
+                const crNode = ov.cornerRadius !== undefined ? { cornerRadius: ov.cornerRadius } : lf.node;
                 holder.children.push(imageWidget(uniqId(`${baseId}_i${ii++}`), x, y, w, h, bmp.name,
-                    256, imgRadius(lf.node, w, h)));
+                    256, imgRadius(crNode, w, h)));
             }
         }
     }
@@ -1353,7 +1378,10 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             }
             if (process.env.F2E_DEBUG && dupImgKeys.size) console.log(`    [dedup] "${n.name}" 去重 ${dupImgKeys.size} 层`);
             for (const c of kids.get(k) || []) {
-                emitStaticNode(c, x, y, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null));
+                // children 坐标相对父部件（EEZ LVGL 语义）——fig 帧内子节点
+                // 的 transform 本就是相对父的，直接传 0,0；传 x,y 会双重偏移
+                // （内容被父 panel clip_corner 裁掉=整屏黑）
+                emitStaticNode(c, 0, 0, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null));
             }
             return p;
         }
@@ -1365,7 +1393,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             const opa = n.opacity !== undefined ? n.opacity : 1;
             const style = { text_color: fill, text_font: font, text_align: figTextAlign(n) };
             if (opa < 1) style.text_opa = Math.round(opa * 255);
-            const lbl = labelWidget(id, x, y, Math.max(w, 12), Math.max(h, 14), chars, style);
+            const lbl = labelWidget(id, x, y, Math.max(w, 12), Math.max(h, 14), chars, style, { fontSize: n.fontSize || 12 });
             out.push(lbl);
             return lbl;
         }
