@@ -227,13 +227,35 @@ function coverCropPng(pngBuf, tw, th) {
         return Buffer.from(pngBuf);
     }
 }
+// 圆角 alpha 遮罩（烘进 PNG——lv_image 不认样式 radius，任何渲染器都正确）
+function applyRadiusMask(png, w, h, r) {
+    try {
+        if (!PngJS) PngJS = require(path.join(__dirname, "node_modules", "pngjs"));
+        const img = PngJS.PNG.sync.read(png);
+        const rad = Math.min(r, Math.min(w, h) / 2);
+        if (rad <= 0) return png;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                // 到四角的圆角距离
+                const cx = x < rad ? rad : (x > w - 1 - rad ? w - 1 - rad : x);
+                const cy = y < rad ? rad : (y > h - 1 - rad ? h - 1 - rad : y);
+                const dx = x - cx, dy = y - cy;
+                const d = Math.sqrt(dx * dx + dy * dy);
+                const i = (y * w + x) * 4;
+                if (d > rad) img.data[i + 3] = 0;
+                else if (d > rad - 1) img.data[i + 3] = Math.round(img.data[i + 3] * (rad - d)); // 1px 抗锯齿边
+            }
+        }
+        return PngJS.PNG.sync.write(img);
+    } catch (e) { return png; }
+}
 // 注册表：hash+WxH → { name, w, h }；同图多档位（卡角 17..24/右屏 36/46）各一条
 function makeBitmapRegistry(ctx) {
     const byKey = new Map(); // "hash_WxH" → rec（同图多档位各一条，档位=节点精确尺寸）
     const images = new Map(((ctx.raw || {}).images || []).map(e => [e[0], e[1]]));
     const reg = {
         bitmaps: [],
-        register(paint, nodeW, nodeH) {
+        register(paint, nodeW, nodeH, radius) {
             const hash = hashHex(paint.image.hash);
             const tw = Math.max(2, Math.round(nodeW || 0)), th = Math.max(2, Math.round(nodeH || 0));
             const key = `${hash}_${tw}x${th}`;
@@ -255,6 +277,7 @@ function makeBitmapRegistry(ctx) {
                 if (nearUniform && sz.w !== tw) { data = resamplePng(png, tw, th); mode = `${sz.w}x${sz.h}→${tw}x${th}`; }
                 else if (!nearUniform) { data = coverCropPng(png, tw, th); mode = `cover ${sz.w}x${sz.h}→${tw}x${th}`; }
             }
+            if (radius > 0) data = applyRadiusMask(data, tw, th, radius); // Figma 圆角烘进 alpha
             reg.bitmaps.push({
                 objID: oid(), name,
                 image: "data:image/png;base64," + Buffer.from(data).toString("base64"),
@@ -357,6 +380,25 @@ function figTextAlign(n) {
         td.textAlignHorizontal || (td.style && td.style.textAlignHorizontal);
     return { L: "LEFT", C: "CENTER", R: "RIGHT", J: "LEFT", LEFT: "LEFT", CENTER: "CENTER", RIGHT: "RIGHT", JUSTIFIED: "LEFT" }[src] || "LEFT";
 }
+// 按钮文本：同父 ROUNDED_RECTANGLE 与文本框重叠>70%（Figma 视觉居中的按钮文字，
+// kiwi 无 align 字段可读，按结构识别——Start Run 106x32 叠 Rectangle 112x28）
+function isButtonText(n, kids, nodes) {
+    const g = n.parentIndex && n.parentIndex.guid;
+    const pk = g ? G(g) : null;
+    if (!pk) return false;
+    const t = n.transform || {};
+    const x = t.m02 || 0, y = t.m12 || 0, w = (n.size || {}).x || 0, h = (n.size || {}).y || 0;
+    for (const ck of kids.get(pk) || []) {
+        const cn = nodes.get(ck);
+        if (cn === n || typeStr(cn) !== "ROUNDED_RECTANGLE") continue;
+        const ct = cn.transform || {};
+        const cx = ct.m02 || 0, cy = ct.m12 || 0, cw = (cn.size || {}).x || 0, ch = (cn.size || {}).y || 0;
+        const ox = Math.max(0, Math.min(x + w, cx + cw) - Math.max(x, cx));
+        const oy = Math.max(0, Math.min(y + h, cy + ch) - Math.max(y, cy));
+        if (ox * oy > 0.7 * w * h) return true;
+    }
+    return false;
+}
 
 // ---------- EEZ 部件工厂（全默认字段，血泪教训全在内） ----------
 let oidCounter = 0;
@@ -411,14 +453,14 @@ function labelWidget(id, x, y, w, h, text, styleProps, opts) {
 }
 
 function imageWidget(id, x, y, w, h, bitmapName, zoom, radius) {
-    const styleDef = radius > 0 ? { MAIN: { DEFAULT: { radius: Math.round(radius), clip_corner: true } } } : {};
+    // 圆角已烘进 PNG alpha（radius 参数仅用于注册位图时的遮罩），样式层不再设
     return makeWidget("LVGLImageWidget", {
         identifier: id, left: Math.round(x), top: Math.round(y),
         width: Math.round(Math.max(w, 4)), height: Math.round(Math.max(h, 4)),
         image: bitmapName, setPivot: false, pivotX: 0, pivotY: 0,
         zoom: Math.round(zoom || 256), angle: 0, innerAlign: "CENTER",
         widgetFlags: DECOR_FLAGS,
-        localStyles: { objID: oid(), definition: styleDef }
+        localStyles: { objID: oid(), definition: {} }
     });
 }
 // Figma cornerRadius → 像素圆角（1000 等哨兵值=全圆；node 无值时矩形）
@@ -1089,6 +1131,8 @@ const PUSH_TO_FADE = {
 function runV2(args, pageKey, page, ctx, codepoints) {
     const { nodes, order, kids } = ctx;
     const bitmapReg = makeBitmapRegistry(ctx);
+    // 同位 IMAGE 组共享最大圆角（右屏图标=圆底+方 Overlay 组，视觉整组圆）
+    const radiusByGeo = new Map();
 
     // ---- 帧与交互收集 ----
     const frameKeys = (kids.get(pageKey) || []).filter(k => typeStr(nodes.get(k)) === "FRAME");
@@ -1280,11 +1324,16 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 const x = lf.x * ex.sx, y = lf.y * ex.sy;
                 const w = lf.w * ex.sx, h = lf.h * ex.sy;
                 const fill = solidFill({ fillPaints: (ov.fillPaints || lf.node.fillPaints || []) }) || "#FFFFFF";
-                const { font } = textFont(lf.node.fontSize, chars);
+                // 字号随实例缩放（Figma 后卡=母版 80%/73% 实例，文字同步缩小；
+                // 原字号在缩小的卡上会过大溢出卡边——"文字偏移出卡"的真凶）
+                const { font } = textFont(lf.node.fontSize * Math.sqrt(ex.sx * ex.sy), chars);
                 const opa = ov.opacity !== undefined ? ov.opacity : (lf.node.opacity !== undefined ? lf.node.opacity : 1);
-                const style = { text_color: fill, text_font: font, text_align: figTextAlign(lf.node) };
+                const style = { text_color: fill, text_font: font, text_align: isButtonText(lf.node, kids, nodes) ? "CENTER" : figTextAlign(lf.node) };
                 if (opa < 1) style.text_opa = Math.round(opa * 255);
-                holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y, Math.max(w, 12), Math.max(h, 14), chars, style, { fontSize: lf.node.fontSize || 12 }));
+                // 垂直居中补偿（Figma 行高框 vs LVGL 顶对齐）
+                const lineH = (lf.node.fontSize || 12) * 1.25;
+                const dy = h > lineH * 1.45 ? Math.round((h - lineH) / 2) : 0;
+                holder.children.push(labelWidget(uniqId(`${baseId}_t${li++}`), x, y + dy, Math.max(w, 12), Math.max(h, 14), chars, style, { fontSize: lf.node.fontSize || 12 }));
             } else if (lf.type === "VECTOR") {
                 // 小图标矢量 → MSR 符号（名匹配或数值伴生推断）；字号=图标几何分档
                 const sym = vectorSymbol(lf.node, lf.w, lf.h) || siblingMetricSymbol(lf.node, kids, nodes);
@@ -1311,10 +1360,10 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 if (!imgP) continue;
                 const x = lf.x * ex.sx, y = lf.y * ex.sy;
                 const w = lf.w * ex.sx, h = lf.h * ex.sy;
-                const bmp = bitmapReg.register(imgP, w, h);
-                if (!bmp) continue;
                 // 圆角读覆盖值优先（Overlay 层的 cornerRadius 覆盖=圆形哨兵 1000）
                 const crNode = ov.cornerRadius !== undefined ? { cornerRadius: ov.cornerRadius } : lf.node;
+                const bmp = bitmapReg.register(imgP, w, h, imgRadius(crNode, w, h));
+                if (!bmp) continue;
                 holder.children.push(imageWidget(uniqId(`${baseId}_i${ii++}`), x, y, w, h, bmp.name,
                     256, imgRadius(crNode, w, h)));
             }
@@ -1322,14 +1371,21 @@ function runV2(args, pageKey, page, ctx, codepoints) {
     }
 
     // 普通节点 → 部件树（装饰件不拦截点击；skipKeys=被 ghost 替代的叶）
-    function emitStaticNode(k, ox, oy, out, skipKeys) {
+    // 180° 翻转检测（kiwi transform 旋转分量；转换器历史只读平移——Timer 组
+    // m00=-1 时渲染框=原点平移再整体翻位，漏读导致"环在右下"错位）
+    const isRot180 = t => t && (t.m00 || 1) < 0 && (t.m11 || 1) < 0 &&
+        Math.abs(t.m01 || 0) < 1e-4 && Math.abs(t.m10 || 0) < 1e-4;
+
+    function emitStaticNode(k, ox, oy, out, skipKeys, mir) {
         const n = nodes.get(k);
         const ty = typeStr(n);
         if (n.visible === false) return null;
         if (skipKeys && skipKeys.has(k)) return null;
         const t = n.transform || {};
-        const x = (t.m02 || 0) + ox, y = (t.m12 || 0) + oy;
         const w = (n.size || {}).x || 0, h = (n.size || {}).y || 0;
+        let x = (t.m02 || 0) + ox, y = (t.m12 || 0) + oy;
+        if (isRot180(t)) { x -= w; y -= h; } // 翻转：m02 经矩阵后原点在右下，左上=原点-尺寸
+        if (mir) { x = mir.w - x - w; y = mir.h - y - h; } // 父 180° 翻转的子元素镜像
         const id = uniqId(sanitize(n.name, "n"));
         if (["FRAME", "SYMBOL", "COMPONENT", "GROUP", "INSTANCE"].includes(ty)) {
             if (ty === "INSTANCE") {
@@ -1377,11 +1433,25 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 }
             }
             if (process.env.F2E_DEBUG && dupImgKeys.size) console.log(`    [dedup] "${n.name}" 去重 ${dupImgKeys.size} 层`);
+            // 同位（同几何不同图）IMAGE 组的 radius 对齐取组内最大——Figma 右屏图标
+            // 组=圆底(cornerRadius 哨兵)+方形 Overlay 叠放，视觉整组是圆；单层各自
+            // 烘焙会让方形 Overlay 露角
+            for (const c of kids.get(k) || []) {
+                const cn = nodes.get(c);
+                if (!cn || cn.visible === false) continue;
+                const ip = imagePaint(cn);
+                if (!ip) continue;
+                const ct = cn.transform || {};
+                const sig = `${Math.round(ct.m02 || 0)},${Math.round(ct.m12 || 0)},${Math.round((cn.size || {}).x || 0)},${Math.round((cn.size || {}).y || 0)}`;
+                const r = cn.cornerRadius || 0;
+                if (r > (radiusByGeo.get(sig) || 0)) radiusByGeo.set(sig, r);
+            }
             for (const c of kids.get(k) || []) {
                 // children 坐标相对父部件（EEZ LVGL 语义）——fig 帧内子节点
                 // 的 transform 本就是相对父的，直接传 0,0；传 x,y 会双重偏移
                 // （内容被父 panel clip_corner 裁掉=整屏黑）
-                emitStaticNode(c, 0, 0, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null));
+                const subMir = isRot180(t) ? { w, h } : null;
+                emitStaticNode(c, 0, 0, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null), subMir);
             }
             return p;
         }
@@ -1391,17 +1461,25 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             const fill = solidFill(n) || "#191919";
             const { font } = textFont(n.fontSize, chars);
             const opa = n.opacity !== undefined ? n.opacity : 1;
-            const style = { text_color: fill, text_font: font, text_align: figTextAlign(n) };
+            const style = { text_color: fill, text_font: font, text_align: isButtonText(n, kids, nodes) ? "CENTER" : figTextAlign(n) };
             if (opa < 1) style.text_opa = Math.round(opa * 255);
-            const lbl = labelWidget(id, x, y, Math.max(w, 12), Math.max(h, 14), chars, style, { fontSize: n.fontSize || 12 });
+            // Figma 文本垂直居中于行高框，LVGL label 顶对齐——单行框高补偿下移
+            const lineH = (n.fontSize || 12) * 1.25;
+            const dy = h > lineH * 1.45 ? Math.round((h - lineH) / 2) : 0;
+            const lbl = labelWidget(id, x, y + dy, Math.max(w, 12), Math.max(h, 14) - dy * 0, chars, style, { fontSize: n.fontSize || 12 });
             out.push(lbl);
             return lbl;
         }
+        // 同位 IMAGE 组共享圆角（组表由 FRAME 分支填充；无组值时回退节点自身）
+        const groupRadius = () => {
+            const gs = `${Math.round(x)},${Math.round(y)},${Math.round(w)},${Math.round(h)}`;
+            return radiusByGeo.has(gs) ? { cornerRadius: radiusByGeo.get(gs) } : n;
+        };
         if (ty === "VECTOR" || ty === "LINE") {
             const nm = (n.name || "").toLowerCase();
             const imgP = imagePaint(n);
             if (imgP) {
-                const bmp = bitmapReg.register(imgP, w, h);
+                const bmp = bitmapReg.register(imgP, w, h, imgRadius(groupRadius(), w, h));
                 if (bmp) {
                     const iw = imageWidget(id, x, y, w, h, bmp.name, 256, imgRadius(n, w, h));
                     out.push(iw);
@@ -1443,9 +1521,9 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         if (["RECTANGLE", "ROUNDED_RECTANGLE", "ELLIPSE", "STAR", "POLYGON", "BOOLEAN_OPERATION"].includes(ty)) {
             const imgP = imagePaint(n);
             if (imgP) {
-                const bmp = bitmapReg.register(imgP, w, h);
+                const bmp = bitmapReg.register(imgP, w, h, imgRadius(groupRadius(), w, h));
                 if (bmp) {
-                    const iw = imageWidget(id, x, y, w, h, bmp.name, 256, imgRadius(n, w, h));
+                    const iw = imageWidget(id, x, y, w, h, bmp.name, 256, imgRadius(groupRadius(), w, h));
                     out.push(iw);
                     return iw;
                 }
@@ -1792,21 +1870,27 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         const scrHandlers = [];
         if (!args.noFlow && screenLoadedComp) scrHandlers.push({ objID: oid(), eventName: "SCREEN_LOADED", handlerType: "flow", userData: 0 });
 
-        // 交互边归类：项级 / 屏级
+        // 交互边归类：PUSH 一律屏级（Figma 的 DRAG 挂 Mask/Button/Timer 等载体上，
+        // 真机语义=全屏手势；对象级收窄反致"只能底部滑/右滑无响应"）；
+        // SMART 轮盘边挂卡（项级）
         const itemEdges = new Map();
         const screenEdges = [];
         for (const e of [...keptStateEdges, ...pushEdges]) {
             if (screenIndexOfFrame.get(e.srcFrame) !== gi) continue;
-            let srcName = null;
-            for (const items of itemsByState) {
-                const it = items.find(i => i.key === e.srcKey);
-                if (it) { srcName = it.name; break; }
-            }
-            if (srcName && srcName !== "Mask") {
-                if (!itemEdges.has(srcName)) itemEdges.set(srcName, []);
-                itemEdges.get(srcName).push(e);
-            } else {
+            if (e.push && e.srcFrame !== e.targetFrame) {
                 screenEdges.push(e);
+            } else {
+                let srcName = null;
+                for (const items of itemsByState) {
+                    const it = items.find(i => i.key === e.srcKey);
+                    if (it) { srcName = it.name; break; }
+                }
+                if (srcName && srcName !== "Mask") {
+                    if (!itemEdges.has(srcName)) itemEdges.set(srcName, []);
+                    itemEdges.get(srcName).push(e);
+                } else {
+                    screenEdges.push(e);
+                }
             }
         }
 
@@ -1904,6 +1988,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         L.push(`// ${stem}_interactions.c — figma2eez 生成（交互不走 flow，原生 LVGL）`);
         L.push(`// 手势路由 + lv_anim 状态链（EASE_IN_OUT ${230}ms）+ lv_screen_load_anim 转场`);
         L.push(`#include "lvgl.h"`);
+        L.push(`#include <stdio.h>`);
         L.push(`#include "screens.h"`);
         L.push(``);
         L.push(`extern objects_t objects;`);
@@ -1912,8 +1997,10 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         L.push(`static void wq_set_y(void *o, int32_t v) { lv_obj_set_y((lv_obj_t *)o, v); }`);
         L.push(`static void wq_set_w(void *o, int32_t v) { lv_obj_set_width((lv_obj_t *)o, v); }`);
         L.push(`static void wq_set_h(void *o, int32_t v) { lv_obj_set_height((lv_obj_t *)o, v); }`);
+        L.push(`static void wq_set_scale(void *o, int32_t v) { lv_obj_set_style_transform_scale_x((lv_obj_t *)o, v, LV_PART_MAIN | LV_STATE_DEFAULT); lv_obj_set_style_transform_scale_y((lv_obj_t *)o, v, LV_PART_MAIN | LV_STATE_DEFAULT); }`);
         L.push(``);
         L.push(`#define WQ_ANIM(obj, fn, cur, end) do { \\`);
+        L.push(`    lv_anim_del((obj), (fn)); /* 清旧动画：连滑中断时避免并存竞态/起点错读 */ \\`);
         L.push(`    lv_anim_t a_; lv_anim_init(&a_); \\`);
         L.push(`    lv_anim_set_var(&a_, (obj)); \\`);
         L.push(`    lv_anim_set_exec_cb(&a_, (fn)); \\`);
@@ -1924,7 +2011,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
         L.push(`} while (0)`);
         L.push(`#define WQ_TO_X(o, e) WQ_ANIM((o), wq_set_x, lv_obj_get_x_aligned(o), (e))`);
         L.push(`#define WQ_TO_Y(o, e) WQ_ANIM((o), wq_set_y, lv_obj_get_y_aligned(o), (e))`);
-        L.push(`#define WQ_TO_W(o, e) WQ_ANIM((o), wq_set_w, lv_obj_get_width(o), (e))`);
+        L.push(`#define WQ_TO_SCALE(o, e) WQ_ANIM((o), wq_set_scale, lv_obj_get_style_transform_scale_x(o, LV_PART_MAIN), (e))`);
         L.push(`#define WQ_TO_H(o, e) WQ_ANIM((o), wq_set_h, lv_obj_get_height(o), (e))`);
         L.push(``);
 
@@ -1957,7 +2044,33 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                     L.push(``);
                 }
                 // 状态链
+                // 诊断回调：收敛后打印几何（生成于 go 尾部引用）
+                const diagVars = d.states[0] ? d.itemsByState[0].filter(it => {
+                    const m = d.matched.find(mm => mm.name === it.name);
+                    return m && m.animated && d.widgetOfItem.get(it.name);
+                }) : [];
+                if (diagVars.length) {
+                    L.push(`static int s_${fn}_diag_state = 1;`);
+                    L.push(`static lv_timer_t *s_${fn}_diag_timer = 0;`);
+                    L.push(`static void ${fn}_diag_cb(lv_timer_t *t) {`);
+                    L.push(`    (void)t;`);
+                    L.push(`    s_${fn}_diag_timer = 0; /* repeat=1 由 LVGL 自删，防悬空 double-free */`);
+                    L.push(`    printf("[aw]${fn} settled st=%d", s_${fn}_diag_state);`);
+                    for (const it of diagVars) {
+                        const w = d.widgetOfItem.get(it.name);
+                        L.push(`; printf(" ${it.name}=(%d,%d,%d,%d)", lv_obj_get_x(${objRef(w.identifier)}), lv_obj_get_y(${objRef(w.identifier)}), lv_obj_get_width(${objRef(w.identifier)}), lv_obj_get_height(${objRef(w.identifier)}))`);
+                        // 首个文本 label 坐标（label 层漂移检测）
+                        const lbl = (w.children || []).find(c => c.type === "LVGLLabelWidget");
+                        if (lbl) {
+                            L.push(`; printf(" ${it.name}T=(%d,%d)", lv_obj_get_x(${objRef(lbl.identifier)}), lv_obj_get_y(${objRef(lbl.identifier)}))`);
+                        }
+                    }
+                    L.push(`; printf("\\n");`);
+                    L.push(`}`);
+                    L.push(``);
+                }
                 L.push(`static void ${fn}_go(int st) {`);
+                L.push(`    printf("[aw]${fn} go st=%d\\n", st);`);
                 L.push(`    s_${fn}_state = st;`);
                 L.push(`    switch (st) {`);
                 d.states.forEach((sk, si) => {
@@ -1969,22 +2082,37 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                         const w = d.widgetOfItem.get(it.name);
                         if (w) L.push(`        lv_obj_move_foreground(${objRef(w.identifier)});`);
                     }
-                    // 几何动画
+                    // 几何动画：x/y 平移 + 整体 scale 缩放（transform_scale, pivot=左上）。
+                    // 不用 set_width/height：那只缩卡面，内容不随动——动画中间帧内容
+                    // 相对卡面错位（Figma Smart Animate 语义=卡与内容一起缩放）
                     for (const it of d.itemsByState[si]) {
                         const m = d.matched.find(mm => mm.name === it.name);
                         if (!m || !m.animated) continue;
                         const w = d.widgetOfItem.get(it.name);
                         if (!w) continue;
+                        const g0 = m.perState.get(0);
                         L.push(`        WQ_TO_X(${objRef(w.identifier)}, ${Math.round(it.x)});`);
                         L.push(`        WQ_TO_Y(${objRef(w.identifier)}, ${Math.round(it.y)});`);
-                        L.push(`        WQ_TO_W(${objRef(w.identifier)}, ${Math.round(it.w)});`);
-                        L.push(`        WQ_TO_H(${objRef(w.identifier)}, ${Math.round(it.h)});`);
+                        L.push(`        WQ_TO_SCALE(${objRef(w.identifier)}, ${Math.round(256 * it.w / (g0.w || it.w))});`);
                     }
                     L.push(`        break;`);
                     L.push(`    }`);
                 });
                 L.push(`    }`);
                 if (d.ghosts.length) L.push(`    ${fn}_ghosts_show(st);`);
+                // 诊断：动画收敛后打印各动画项实际几何（300ms 一次性 timer）
+                const diagItems = d.states[0] ? d.itemsByState[0].filter(it => {
+                    const m = d.matched.find(mm => mm.name === it.name);
+                    return m && m.animated && d.widgetOfItem.get(it.name);
+                }) : [];
+                if (diagItems.length) {
+                    L.push(`    {`);
+                    L.push(`        s_${fn}_diag_state = st;`);
+                    L.push(`        if (s_${fn}_diag_timer) lv_timer_del(s_${fn}_diag_timer);`);
+                    L.push(`        s_${fn}_diag_timer = lv_timer_create(${fn}_diag_cb, 300, 0);`);
+                    L.push(`        lv_timer_set_repeat_count(s_${fn}_diag_timer, 1);`);
+                    L.push(`    }`);
+                }
                 L.push(`}`);
                 L.push(``);
                 // 部件手势路由（卡轮盘 + 部件 PUSH）
@@ -2022,52 +2150,30 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                     }
                 }
             } else {
-                // 单状态屏：只有 PUSH 边
-                const fnItem = `${fn}_items_gesture_cb`;
-                const itemPush = [...d.itemEdges.entries()].filter(([, edges]) => edges.some(ed => ed.push && ed.srcFrame !== ed.targetFrame));
-                if (itemPush.length) {
-                    L.push(`// ==== ${fn} ====`);
-                    L.push(`static void ${fnItem}(lv_event_t *e) {`);
-                    L.push(`    lv_obj_t *obj = lv_event_get_target(e);`);
-                    for (const [nm, edges] of itemPush) {
-                        const w = d.widgetOfItem.get(nm);
-                        if (!w) continue;
-                        L.push(`    if (obj == ${objRef(w.identifier)}) {`);
-                        const seen = new Set();
-                        for (const ed of edges) {
-                            if (!ed.push || ed.srcFrame === ed.targetFrame) continue;
-                            const dir = PUSH_TO_DIR[ed.nav] || "LV_DIR_LEFT";
-                            const anim = PUSH_TO_ANIM[ed.nav] || "LV_SCR_LOAD_ANIM_FADE_IN";
-                            const key = dir + ed.targetFrame;
-                            if (seen.has(key)) continue;
-                            seen.add(key);
-                            L.push(`        if (lv_indev_get_gesture_dir(lv_indev_active()) == ${dir}) { lv_screen_load_anim(${objRef(scrNameOf(ed.targetFrame))}, ${anim}, ${ed.duration}, 0, false); return; }`);
-                        }
-                        L.push(`        return;`);
-                        L.push(`    }`);
-                    }
-                    L.push(`}`);
-                    L.push(``);
-                    for (const [nm] of itemPush) {
-                        const w = d.widgetOfItem.get(nm);
-                        if (w) initLines.push(`    lv_obj_add_event_cb(${objRef(w.identifier)}, ${fnItem}, LV_EVENT_GESTURE, NULL);`);
-                    }
-                }
+                // 单状态屏：PUSH 边已全部并入屏级手势（对象级不再生成）
             }
-            // 屏级手势（Mask 全幅拖拽 = 屏空白区）
+            // 屏级手势（全屏任意位置；Figma DRAG 无 dragDirection=任意方向，
+            // 单目标方向集时任意拖触发，双向屏（middle）按方向消歧）
             const scrPush = d.screenEdges.filter(ed => ed.push && ed.srcFrame !== ed.targetFrame);
             if (scrPush.length) {
-                L.push(`static void ${fn}_screen_gesture_cb(lv_event_t *e) {`);
-                L.push(`    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());`);
-                L.push(`    (void)e;`);
-                const seen = new Set();
+                const byDir = new Map(); // dir → 第一条边
                 for (const ed of scrPush) {
                     const dir = PUSH_TO_DIR[ed.nav] || "LV_DIR_LEFT";
+                    if (!byDir.has(dir)) byDir.set(dir, ed);
+                }
+                L.push(`static void ${fn}_screen_gesture_cb(lv_event_t *e) {`);
+                if (byDir.size === 1) {
+                    const [dir, ed] = [...byDir.entries()][0];
                     const anim = PUSH_TO_ANIM[ed.nav] || "LV_SCR_LOAD_ANIM_FADE_IN";
-                    const key = dir + ed.targetFrame;
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    L.push(`    if (d == ${dir}) { lv_screen_load_anim(${objRef(scrNameOf(ed.targetFrame))}, ${anim}, ${ed.duration}, 0, false); return; }`);
+                    L.push(`    (void)e; (void)lv_indev_get_gesture_dir(lv_indev_active());`);
+                    L.push(`    lv_screen_load_anim(${objRef(scrNameOf(ed.targetFrame))}, ${anim}, ${ed.duration}, 0, false);`);
+                } else {
+                    L.push(`    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());`);
+                    L.push(`    (void)e;`);
+                    for (const [dir, ed] of byDir.entries()) {
+                        const anim = PUSH_TO_ANIM[ed.nav] || "LV_SCR_LOAD_ANIM_FADE_IN";
+                        L.push(`    if (d == ${dir}) { lv_screen_load_anim(${objRef(scrNameOf(ed.targetFrame))}, ${anim}, ${ed.duration}, 0, false); return; }`);
+                    }
                 }
                 L.push(`}`);
                 L.push(``);
@@ -2076,9 +2182,21 @@ function runV2(args, pageKey, page, ctx, codepoints) {
             if (d.hasStates && d.ghosts.length) {
                 initLines.push(`    ${fn}_ghosts_show(1);`);
             }
+            // scale 动画的卡：pivot 固定左上（x/y 语义与 Figma 帧坐标一致）
+            if (d.hasStates) {
+                for (const it of (d.itemsByState[0] || [])) {
+                    const m = d.matched.find(mm => mm.name === it.name);
+                    if (!m || !m.animated) continue;
+                    const w = d.widgetOfItem.get(it.name);
+                    if (!w) continue;
+                    initLines.push(`    lv_obj_set_style_transform_pivot_x(${objRef(w.identifier)}, 0, LV_PART_MAIN | LV_STATE_DEFAULT);`);
+                    initLines.push(`    lv_obj_set_style_transform_pivot_y(${objRef(w.identifier)}, 0, LV_PART_MAIN | LV_STATE_DEFAULT);`);
+                }
+            }
         }
 
         L.push(`void ${stem}_interactions_init(void) {`);
+        L.push(`    printf("[aw] interactions init v2\\n");`);
         L.push(...initLines);
         L.push(`}`);
         L.push(``);
