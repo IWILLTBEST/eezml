@@ -703,7 +703,7 @@ function runV1(args, pageKey, page, ctx, codepoints) {
         if (ty === "TEXT") {
             const chars = ((n.textData || {}).characters) || "";
             const fill = solidFill(n) || "#191919";
-            const { font } = textFont(n.fontSize * scl, chars);
+            const { font } = textFont(n.fontSize, chars);
             const id = uniqId("label");
             const lw = Math.max(w, 12), lh = Math.max(h, 14);
             const lbl = labelWidget(id, x, y, lw, lh, chars, { text_color: fill, text_font: font });
@@ -1371,43 +1371,21 @@ function runV2(args, pageKey, page, ctx, codepoints) {
     }
 
     // 普通节点 → 部件树（装饰件不拦截点击；skipKeys=被 ghost 替代的叶）
-    // 3x3 仿射矩阵工具（行主序 [a,b,tx,c,d,ty]）。kiwi transform 完整语义：
-    // 父坐标 = 累计矩阵 × 节点矩阵 × 自身坐标（原点=左上）。历史实现只读平移
-    // 分量——Timer 组 180° 翻转+Oval 0.73 缩放全被忽略（环错位 112px/尺寸偏大）
-    const M3 = {
-        ident: () => [1, 0, 0, 0, 1, 0],
-        ofNode: n => { const t = n.transform || {}; return [t.m00 !== undefined ? t.m00 : 1, t.m01 || 0, t.m02 || 0, t.m10 || 0, t.m11 !== undefined ? t.m11 : 1, t.m12 || 0]; },
-        mul: (A, B) => [
-            A[0] * B[0] + A[1] * B[3], A[0] * B[1] + A[1] * B[4], A[0] * B[2] + A[1] * B[5] + A[2],
-            A[3] * B[0] + A[4] * B[3], A[3] * B[1] + A[4] * B[4], A[3] * B[2] + A[4] * B[5] + A[5],
-        ],
-        apply: (M, x, y) => [M[0] * x + M[1] * y + M[2], M[3] * x + M[4] * y + M[5]],
-    };
-    // 节点在累计矩阵下的渲染框（轴对齐 bbox）+ 均匀缩放率
-    function nodeBox(n, M) {
-        // 中心锚定：中心=累计矩阵作用于自身中心；尺寸=原始×均匀缩放。
-        // 旋转节点（Oval 43°、Timer 180°）bbox 会放大框且中心漂移，LVGL 无旋转，
-        // 中心锚定是无旋转渲染的最佳近似；无旋转时与平移法逐像素等价
-        const Mb = M3.mul(M, M3.ofNode(n));
-        const w0 = (n.size || {}).x || 0, h0 = (n.size || {}).y || 0;
-        const scale = Math.sqrt(Math.abs(Mb[0] * Mb[4] - Mb[1] * Mb[3])) || 1;
-        const c = M3.apply(Mb, w0 / 2, h0 / 2);
-        return {
-            x: c[0] - w0 * scale / 2, y: c[1] - h0 * scale / 2,
-            w: w0 * scale, h: h0 * scale,
-            M: Mb, scale
-        };
-    }
+    // 180° 翻转检测（kiwi transform 旋转分量；转换器历史只读平移——Timer 组
+    // m00=-1 时渲染框=原点平移再整体翻位，漏读导致"环在右下"错位）
+    const isRot180 = t => t && (t.m00 || 1) < 0 && (t.m11 || 1) < 0 &&
+        Math.abs(t.m01 || 0) < 1e-4 && Math.abs(t.m10 || 0) < 1e-4;
 
-    function emitStaticNode(k, M, out, skipKeys) {
+    function emitStaticNode(k, ox, oy, out, skipKeys, mir) {
         const n = nodes.get(k);
         const ty = typeStr(n);
         if (n.visible === false) return null;
         if (skipKeys && skipKeys.has(k)) return null;
-        const box = nodeBox(n, M);
-        const { x, y } = box;
-        const w = box.w, h = box.h;
-        const scl = box.scale; // 均匀缩放（字号/描边/圆角随缩）
+        const t = n.transform || {};
+        const w = (n.size || {}).x || 0, h = (n.size || {}).y || 0;
+        let x = (t.m02 || 0) + ox, y = (t.m12 || 0) + oy;
+        if (isRot180(t)) { x -= w; y -= h; } // 翻转：m02 经矩阵后原点在右下，左上=原点-尺寸
+        if (mir) { x = mir.w - x - w; y = mir.h - y - h; } // 父 180° 翻转的子元素镜像
         const id = uniqId(sanitize(n.name, "n"));
         if (["FRAME", "SYMBOL", "COMPONENT", "GROUP", "INSTANCE"].includes(ty)) {
             if (ty === "INSTANCE") {
@@ -1472,7 +1450,8 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 // children 坐标相对父部件（EEZ LVGL 语义）——fig 帧内子节点
                 // 的 transform 本就是相对父的，直接传 0,0；传 x,y 会双重偏移
                 // （内容被父 panel clip_corner 裁掉=整屏黑）
-                emitStaticNode(c, box.M, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null));
+                const subMir = isRot180(t) ? { w, h } : null;
+                emitStaticNode(c, 0, 0, p.children, skipKeys ? new Set([...skipKeys, ...dupImgKeys]) : (dupImgKeys.size ? new Set(dupImgKeys) : null), subMir);
             }
             return p;
         }
@@ -1534,7 +1513,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 fill ? { bg_color: fill } : { bg_opa: 0 },
                 fill && fillOpa(n) < 255 ? { bg_opa: fillOpa(n) } : {},
                 radius ? { radius } : {},
-                stroke && stroke.width > 0 ? { border_color: stroke.color, border_width: Math.max(1, Math.round(stroke.width * scl)) } : {});
+                stroke && stroke.width > 0 ? { border_color: stroke.color, border_width: stroke.width } : {});
             const p = panelWidget(id, x, y, Math.max(w, 4), Math.max(h, 4), style);
             out.push(p);
             return p;
@@ -1559,7 +1538,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 fill ? { bg_color: fill } : { bg_opa: 0 },
                 opa < 255 ? { bg_opa: opa } : {},
                 radius ? { radius } : {},
-                stroke && stroke.width > 0 ? { border_color: stroke.color, border_width: Math.max(1, Math.round(stroke.width * scl)) } : {});
+                stroke && stroke.width > 0 ? { border_color: stroke.color, border_width: stroke.width } : {});
             const p = panelWidget(id, x, y, w, h, style);
             out.push(p);
             return p;
@@ -1683,7 +1662,7 @@ function runV2(args, pageKey, page, ctx, codepoints) {
                 w = panelWidget(uniqId(sanitize(it.name, "inst")), it.x, it.y, it.w, it.h, ex ? ex.panelStyle : { bg_opa: 0 });
                 emitInstanceChildren(it.node, w, w.identifier);
             } else {
-                w = emitStaticNode(it.key, M3.ident(), screenChildren, ghostSkipKeys);
+                w = emitStaticNode(it.key, 0, 0, screenChildren, ghostSkipKeys);
                 if (w) { widgetOfItem.set(it.name, w); continue; }
             }
             if (w) { screenChildren.push(w); widgetOfItem.set(it.name, w); }
